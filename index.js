@@ -10,7 +10,6 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: "https://testvibe-cc69f-default-rtdb.firebaseio.com"
 });
-
 const db = admin.database();
 const app = express();
 app.use(cors());
@@ -128,7 +127,7 @@ setInterval(sweepSubscriptions, 60000); // Runs every 1 minute
 // 🚀 Manual Sweeper API (Visit this URL in a browser to force clean)
 app.get('/sweep', async (req, res) => {
   await sweepSubscriptions();
-  res.send('<h1>🧹 Sweeper Triggered!</h1>');
+  res.send('<h1>🧹 Sweeper Triggered! Check your Firebase Database!</h1>');
 });
 
 app.get('/', (req, res) => res.send('Heartbeat Server is Running 🚀'));
