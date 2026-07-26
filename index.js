@@ -37,7 +37,6 @@ const activeUsers = new Map();
 io.on('connection', (socket) => {
   console.log(`\n[🔌 NEW CONNECTION] Socket ID: ${socket.id}`);
 
-  // 1. Register User
   socket.on('register_user', async (data) => {
     const { uid, email, screen } = data;
     if (!uid) return;
@@ -48,37 +47,30 @@ io.on('connection', (socket) => {
 
     try {
       await rtdb.ref(`users/${uid}`).update({ IsActive: true });
-      console.log(`[✅ REGISTERED] ${email || uid} active on screen: ${screen}`);
-    } catch (error) { console.log(`[❌ RTDB ERROR] Failed setting active:`, error); }
+    } catch (error) { console.log(`[❌ RTDB ERROR]`, error); }
   });
 
-  // 2. Track Queue Status
   socket.on('set_queue_status', (data) => {
     if (activeUsers.has(socket.id)) {
       const user = activeUsers.get(socket.id);
       user.inQueue = data.inQueue;
       if (data.email) user.email = data.email;
-      console.log(`[🎯 QUEUE STATUS] ${user.email} searching status: ${data.inQueue}`);
     }
   });
 
-  // 3. Track Active Room Status
   socket.on('set_room_status', (data) => {
     if (activeUsers.has(socket.id)) {
       const user = activeUsers.get(socket.id);
       user.roomId = data.roomId;
-      console.log(`[📞 ROOM STATUS] ${user.email || user.uid} is in room: ${data.roomId || 'None'}`);
     }
   });
 
-  // 4. Heartbeat Listener
   socket.on('ping', () => {
     if (activeUsers.has(socket.id)) {
       activeUsers.get(socket.id).lastPing = Date.now();
     }
   });
 
-  // 5. Ad Status Listener
   socket.on('ad_status', (data) => {
     if (activeUsers.has(socket.id)) {
       const user = activeUsers.get(socket.id);
@@ -102,7 +94,6 @@ io.on('connection', (socket) => {
 setInterval(async () => {
   const now = Date.now();
   for (const [socketId, user] of activeUsers.entries()) {
-    // 🚀 15 SECOND GRACE PERIOD prevents flickering drops!
     const timeoutThreshold = user.isWatchingAd ? 120000 : 15000; 
 
     if (now - user.lastPing > timeoutThreshold) {
@@ -125,14 +116,10 @@ async function handleUserDrop(socketId, reason) {
       if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false });
     } catch (error) {}
 
-    // Clean Queue
     if (user.email && user.inQueue) {
-      try {
-        await firestore.collection('randomQueue').doc(user.email).delete();
-      } catch (error) {}
+      try { await firestore.collection('randomQueue').doc(user.email).delete(); } catch (error) {}
     }
 
-    // Clean Video Room!
     if (user.roomId) {
       try {
         await firestore.collection('room').doc(user.roomId).delete();
@@ -190,9 +177,6 @@ async function sweepSubscriptions() {
 }
 setInterval(sweepSubscriptions, 60000); 
 
-app.get('/sweep', async (req, res) => { await sweepSubscriptions(); res.send('Sweep Complete'); });
-app.get('/sweep-queue', async (req, res) => { await sweepOldQueueDocs(); res.send('Queue Purged'); });
 app.get('/', (req, res) => res.send('MeetVibe Dual-Admin Server Running 🚀'));
-
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`\n🚀 Server listening on port ${PORT}`));
