@@ -50,7 +50,7 @@ async function forceWipeRoom(roomId) {
     await batch.commit();
     await roomRef.delete();
     
-    console.log(`[✅ FIRESTORE SUCCESS] Deleted Room ${roomId} | callerCandidates: ${callerCount} | calleeCandidates: ${calleeCount}`);
+    console.log(`[✅ FIRESTORE SUCCESS] Deleted Room ${roomId} and all ${callerCount + calleeCount} candidates!`);
   } catch (error) {
     console.log(`[❌ FIRESTORE ERROR] Failed to clean room ${roomId}:`, error);
   }
@@ -117,7 +117,7 @@ io.on('connection', (socket) => {
 setInterval(async () => {
   const now = Date.now();
   for (const [socketId, user] of activeUsers.entries()) {
-    // 15s server timeout buffer allows client 10s network switch to function properly
+    // 15s server timeout allows client 10s network switch to function properly
     const timeoutThreshold = user.isWatchingAd ? 120000 : 15000; 
     if (now - user.lastPing > timeoutThreshold) {
       console.log(`[🕒 TIMEOUT] User ${user.email || user.uid} missed pings for over ${timeoutThreshold/1000}s`);
@@ -149,7 +149,7 @@ async function handleUserDrop(socketId, reason) {
   }
 }
 
-// 📅 STALE QUEUE SWEEPER (FIRESTORE)
+// 📅 STALE QUEUE SWEEPER
 setInterval(async () => {
   try {
     const snapshot = await firestore.collection('randomQueue').get();
@@ -165,29 +165,6 @@ setInterval(async () => {
     }
   } catch (error) {}
 }, 30 * 60 * 1000);
-
-// 💎 TOTAL SUBSCRIPTION SWEEPER (RTDB)
-setInterval(async () => {
-  try {
-    const snap = await rtdb.ref('TotalSubscriptions').once('value');
-    if (!snap.exists()) return;
-    const subscriptions = snap.val();
-    const now = new Date(); 
-    for (const [dateKey, subData] of Object.entries(subscriptions)) {
-      const parts = dateKey.split('-');
-      if (parts.length >= 7) {
-        const expDate = new Date(parts[2], parts[1]-1, parts[0], parts[3], parts[4], parts[5], parts[6]);
-        if (expDate <= now) {
-          if (subData.userId) {
-            await rtdb.ref(`users/${subData.userId}/Subscription`).remove();
-            await rtdb.ref(`users/${subData.userId}`).update({ IsVip: false }); 
-          }
-          await rtdb.ref(`TotalSubscriptions/${dateKey}`).remove();
-        }
-      }
-    }
-  } catch (error) {}
-}, 60000); 
 
 app.get('/', (req, res) => res.send('MeetVibe Dual-Admin Server Running 🚀'));
 const PORT = process.env.PORT || 3000;
