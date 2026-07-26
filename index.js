@@ -102,7 +102,7 @@ io.on('connection', (socket) => {
 setInterval(async () => {
   const now = Date.now();
   for (const [socketId, user] of activeUsers.entries()) {
-    // 🚀 THE FIX: Increased network drop threshold from 6 seconds to 15 seconds!
+    // 🚀 15 SECOND GRACE PERIOD prevents flickering drops!
     const timeoutThreshold = user.isWatchingAd ? 120000 : 15000; 
 
     if (now - user.lastPing > timeoutThreshold) {
@@ -123,15 +123,16 @@ async function handleUserDrop(socketId, reason) {
 
     try {
       if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false });
-    } catch (error) { console.log(`[❌ RTDB ERROR]`, error); }
+    } catch (error) {}
 
+    // Clean Queue
     if (user.email && user.inQueue) {
       try {
         await firestore.collection('randomQueue').doc(user.email).delete();
-        console.log(`[🔥 FIRESTORE] Deleted ${user.email} from randomQueue due to drop!`);
       } catch (error) {}
     }
 
+    // Clean Video Room!
     if (user.roomId) {
       try {
         await firestore.collection('room').doc(user.roomId).delete();
