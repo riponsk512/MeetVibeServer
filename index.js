@@ -5,20 +5,19 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 
 // ==========================================
-// 🔑 1. DUAL FIREBASE ADMIN INITIALIZATION
+// 🔑 DUAL FIREBASE ADMIN INITIALIZATION
 // ==========================================
 
-// APP 1: Realtime Database (User Status & VIP Subscriptions)
+// APP 1: Realtime Database (User Status & Subscriptions)
 const rtdbServiceAccount = require('./serviceAccountKey.json');
 const rtdbApp = admin.initializeApp({
    credential: admin.credential.cert(rtdbServiceAccount),
   databaseURL: "https://testvibe-cc69f-default-rtdb.firebaseio.com" // ⚠️ REPLACE WITH YOUR RTDB URL
 }, 'rtdbApp');
-
 const rtdb = rtdbApp.database();
 
-// APP 2: Cloud Firestore (MeetVibeVideoChatDb -> randomQueue)
-const firestoreServiceAccount = require('./videoChatfirestoreServiceAccountKey.json');
+// APP 2: Cloud Firestore (MeetVibeVideoChatDb -> randomQueue & room)
+const firestoreServiceAccount = require('./firestoreServiceAccountKey.json');
 const firestoreApp = admin.initializeApp({
   credential: admin.credential.cert(firestoreServiceAccount)
 }, 'firestoreApp');
@@ -33,19 +32,19 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
-// Track active users: socket.id -> { uid, email, screen, lastPing, isWatchingAd, inQueue }
+// Track active users: socket.id -> { uid, email, screen, lastPing, isWatchingAd, inQueue, roomId }
 const activeUsers = new Map();
 
 io.on('connection', (socket) => {
   console.log(`\n[🔌 NEW CONNECTION] Socket ID: ${socket.id}`);
 
-  // 1. Register User on App Startup
+  // 1. Register User
   socket.on('register_user', async (data) => {
     const { uid, email, screen } = data;
     if (!uid) return;
     
     activeUsers.set(socket.id, { 
-      uid, email, screen, lastPing: Date.now(), isWatchingAd: false, inQueue: false 
+      uid, email, screen, lastPing: Date.now(), isWatchingAd: false, inQueue: false, roomId: null 
     });
 
     try {
@@ -56,7 +55,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 2. User Enters / Exits Random Queue
+  // 2. Track Queue Status
   socket.on('set_queue_status', (data) => {
     if (activeUsers.has(socket.id)) {
       const user = activeUsers.get(socket.id);
@@ -66,14 +65,23 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 3. Heartbeat Ping Listener (4-Second Interval)
+  // 3. Track Active Room Status (For InCallScreen)
+  socket.on('set_room_status', (data) => {
+    if (activeUsers.has(socket.id)) {
+      const user = activeUsers.get(socket.id);
+      user.roomId = data.roomId;
+      console.log(`[📞 ROOM STATUS] ${user.email || user.uid} is in room: ${data.roomId || 'None'}`);
+    }
+  });
+
+  // 4. Heartbeat Listener
   socket.on('ping', () => {
     if (activeUsers.has(socket.id)) {
       activeUsers.get(socket.id).lastPing = Date.now();
     }
   });
 
-  // 4. Ad Status Listener (2-Minute Grace Period)
+  // 5. Ad Status Listener
   socket.on('ad_status', (data) => {
     if (activeUsers.has(socket.id)) {
       const user = activeUsers.get(socket.id);
@@ -83,13 +91,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 5. Manual Disconnect (App Backgrounded or Left Screen)
+  // 6. App Background Disconnect
   socket.on('manual_disconnect', async () => {
     console.log(`[⚠️ MANUAL DISCONNECT] Socket ${socket.id}`);
     await handleUserDrop(socket.id, 'App Backgrounded/Closed');
   });
 
-  // 6. Socket Disconnect (Network Failure / App Killed)
+  // 7. Network Drop Disconnect
   socket.on('disconnect', () => {
     console.log(`[🔌 DISCONNECTED] Socket ID: ${socket.id}`);
     handleUserDrop(socket.id, 'Socket Connection Lost');
@@ -97,7 +105,7 @@ io.on('connection', (socket) => {
 });
 
 // ==========================================
-// 🚨 HEARTBEAT SWEEPER (Runs every 4 seconds)
+// 🚨 HEARTBEAT SWEEPER (Runs every 4s)
 // ==========================================
 setInterval(async () => {
   const now = Date.now();
@@ -105,7 +113,7 @@ setInterval(async () => {
     const timeoutThreshold = user.isWatchingAd ? 120000 : 6000; 
 
     if (now - user.lastPing > timeoutThreshold) {
-      console.log(`[🕒 TIMEOUT] ${user.email} missed pings for ${timeoutThreshold / 1000}s.`);
+      console.log(`[🕒 TIMEOUT] ${user.email || user.uid} missed pings.`);
       await handleUserDrop(socketId, 'Missed Ping (Internet Drop / App Killed)');
       io.to(socketId).emit('force_disconnect');
     }
@@ -120,30 +128,73 @@ async function handleUserDrop(socketId, reason) {
     const user = activeUsers.get(socketId);
     console.log(`[🛑 DROPPING USER] ${user.email || user.uid} | Reason: ${reason}`);
 
-    // 1. Set IsActive to false in Realtime Database
+    // 1. Set IsActive to false in RTDB
     try {
       if (user.uid) {
         await rtdb.ref(`users/${user.uid}`).update({ IsActive: false });
-        console.log(`[💾 RTDB] Set IsActive=FALSE for ${user.email}`);
       }
-    } catch (error) { 
-      console.log(`[❌ RTDB ERROR]`, error); 
-    }
+    } catch (error) { console.log(`[❌ RTDB ERROR]`, error); }
 
     // 2. 🚀 INSTANT FIRESTORE QUEUE DELETION
-    // ONLY delete if they actually had the queue screen open!
     if (user.email && user.inQueue) {
       try {
         await firestore.collection('randomQueue').doc(user.email).delete();
-        console.log(`[🔥 FIRESTORE QUEUE] Deleted ${user.email} from randomQueue!`);
+        console.log(`[🔥 FIRESTORE] Deleted ${user.email} from randomQueue due to drop!`);
       } catch (error) {
-        console.log(`[❌ FIRESTORE QUEUE ERROR] Failed to delete ${user.email}:`, error);
+        console.log(`[❌ FIRESTORE ERROR]`, error);
+      }
+    }
+
+    // 3. 🚀 INSTANT FIRESTORE ROOM DELETION (Kills call for the other user)
+    if (user.roomId) {
+      try {
+        await firestore.collection('room').doc(user.roomId).delete();
+        console.log(`[📞 FIRESTORE] Deleted room ${user.roomId} because participant dropped!`);
+      } catch (error) {
+        console.log(`[❌ FIRESTORE ROOM ERROR]`, error);
       }
     }
 
     activeUsers.delete(socketId);
   }
 }
+
+// ==========================================
+// 📅 STALE QUEUE SWEEPER (FIRESTORE - Runs every 30 mins)
+// ==========================================
+async function sweepOldQueueDocs() {
+  console.log('\n[🔍 QUEUE SWEEPER] Checking for expired dates in randomQueue...');
+  try {
+    const snapshot = await firestore.collection('randomQueue').get();
+    if (snapshot.empty) return;
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0); 
+
+    let deletedCount = 0;
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      let docCreatedDate = null;
+
+      if (data.createdAt && data.createdAt.toDate) {
+        docCreatedDate = data.createdAt.toDate();
+      } else if (data.createdAt) {
+        docCreatedDate = new Date(data.createdAt);
+      }
+
+      if (docCreatedDate && docCreatedDate < todayStart) {
+        console.log(`[🗑️ PURGING STALE QUEUE] Email: ${doc.id}`);
+        await firestore.collection('randomQueue').doc(doc.id).delete();
+        deletedCount++;
+      }
+    }
+    console.log(`[✅ QUEUE SWEEPER DONE] Cleaned ${deletedCount} old queue documents.`);
+  } catch (error) {
+    console.log('[❌ QUEUE SWEEPER ERROR]', error);
+  }
+}
+setInterval(sweepOldQueueDocs, 30 * 60 * 1000);
 
 // ==========================================
 // 💎 TOTAL SUBSCRIPTION SWEEPER (RTDB - Runs every 60s)
@@ -183,61 +234,10 @@ async function sweepSubscriptions() {
     }
   } catch (error) { console.log('[❌ RTDB SWEEPER ERROR]', error); }
 }
-
 setInterval(sweepSubscriptions, 60000); 
 
-// ==========================================
-// 📅 STALE QUEUE SWEEPER (FIRESTORE - Runs every 30 mins)
-// ==========================================
-async function sweepOldQueueDocs() {
-  console.log('\n[🔍 QUEUE SWEEPER] Checking for expired dates in randomQueue...');
-  try {
-    const snapshot = await firestore.collection('randomQueue').get();
-    if (snapshot.empty) return;
-
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0); // Midnight today 
-
-    let deletedCount = 0;
-
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
-      let docCreatedDate = null;
-
-      if (data.createdAt && data.createdAt.toDate) {
-        docCreatedDate = data.createdAt.toDate();
-      } else if (data.createdAt) {
-        docCreatedDate = new Date(data.createdAt);
-      }
-
-      // Check if createdAt is strictly older than today
-      if (docCreatedDate && docCreatedDate < todayStart) {
-        console.log(`[🗑️ PURGING STALE QUEUE] Email: ${doc.id}`);
-        await firestore.collection('randomQueue').doc(doc.id).delete();
-        deletedCount++;
-      }
-    }
-    console.log(`[✅ QUEUE SWEEPER DONE] Cleaned ${deletedCount} old queue documents.`);
-  } catch (error) {
-    console.log('[❌ QUEUE SWEEPER ERROR]', error);
-  }
-}
-
-setInterval(sweepOldQueueDocs, 30 * 60 * 1000);
-
-// ==========================================
-// 🚀 MANUAL API ENDPOINTS
-// ==========================================
-app.get('/sweep', async (req, res) => {
-  await sweepSubscriptions();
-  res.send('<h1>🧹 RTDB Sweeper Triggered!</h1>');
-});
-
-app.get('/sweep-queue', async (req, res) => {
-  await sweepOldQueueDocs();
-  res.send('<h1>🧹 Firestore Old Queue Purge Executed!</h1>');
-});
-
+app.get('/sweep', async (req, res) => { await sweepSubscriptions(); res.send('Sweep Complete'); });
+app.get('/sweep-queue', async (req, res) => { await sweepOldQueueDocs(); res.send('Queue Purged'); });
 app.get('/', (req, res) => res.send('MeetVibe Dual-Admin Server Running 🚀'));
 
 const PORT = process.env.PORT || 3000;
