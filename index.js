@@ -169,6 +169,6 @@ setInterval(async () => {
   } catch (error) {}
 }, 30 * 60 * 1000);
 
-app.get('/', (req, res) => res.send('MeetVibe Dual-Admin Server Running 🚀'));
+app.get('/', (req, res) => res.send('MeetVibe Server Running 🚀'));
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`\n🚀 Server listening on port ${PORT}`));
