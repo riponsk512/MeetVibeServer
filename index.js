@@ -17,7 +17,7 @@ const rtdbApp = admin.initializeApp({
 const rtdb = rtdbApp.database();
 
 // APP 2: Cloud Firestore (MeetVibeVideoChatDb -> randomQueue & room)
-const firestoreServiceAccount = require('./firestoreServiceAccountKey.json');
+const firestoreServiceAccount = require('./videoChatfirestoreServiceAccountKey.json');
 const firestoreApp = admin.initializeApp({
   credential: admin.credential.cert(firestoreServiceAccount)
 }, 'firestoreApp');
