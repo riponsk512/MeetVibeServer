@@ -21,6 +21,7 @@ const firestoreApp = admin.initializeApp({
 }, 'firestoreApp');
 const firestore = firestoreApp.firestore();
 
+
 const app = express();
 app.use(cors());
 
@@ -78,7 +79,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 🚀 NEW SOCKET LISTENER: TRIGGERED INSTANTLY BY CLIENT ON END/NEXT/BACKGROUND
+  // 🚀 SOCKET LISTENER: TRIGGERED INSTANTLY BY CLIENT ON END/NEXT/BACKGROUND
   socket.on('destroy_room', async ({ roomId }) => {
     await forceWipeRoom(roomId);
   });
@@ -126,7 +127,6 @@ async function handleUserDrop(socketId, reason) {
       try { await firestore.collection('randomQueue').doc(user.email).delete(); } catch (error) {}
     }
 
-    // Call the wiping function when network drops entirely
     if (user.roomId) {
       await forceWipeRoom(user.roomId);
     }
