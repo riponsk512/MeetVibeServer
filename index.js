@@ -28,28 +28,31 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 
 const activeUsers = new Map();
 
-// 🚀 CORE FUNCTION: INSTANTLY WIPES ROOM & SUBCOLLECTIONS
+// 🚀 CORE FUNCTION: INSTANTLY WIPES ROOM & SUBCOLLECTIONS COMPLETELY
 async function forceWipeRoom(roomId) {
   if (!roomId) return;
   try {
+    console.log(`[🗑️ SERVER WIPE] Initiating instant wipe for Room ID: ${roomId}`);
     const roomRef = firestore.collection('room').doc(roomId);
     const batch = firestore.batch();
 
     // 1. Queue deletion of all callerCandidates
     const callerCands = await roomRef.collection('callerCandidates').get();
-    callerCands.forEach(doc => batch.delete(doc.ref));
+    let callerCount = 0;
+    callerCands.forEach(doc => { batch.delete(doc.ref); callerCount++; });
 
     // 2. Queue deletion of all calleeCandidates
     const calleeCands = await roomRef.collection('calleeCandidates').get();
-    calleeCands.forEach(doc => batch.delete(doc.ref));
+    let calleeCount = 0;
+    calleeCands.forEach(doc => { batch.delete(doc.ref); calleeCount++; });
 
     // 3. Execute batch & delete main document
     await batch.commit();
     await roomRef.delete();
     
-    console.log(`[📞 FIRESTORE] Instantly wiped Room ID: ${roomId} and all candidates!`);
+    console.log(`[✅ FIRESTORE SUCCESS] Deleted Room ${roomId} | callerCandidates: ${callerCount} | calleeCandidates: ${calleeCount}`);
   } catch (error) {
-    console.log(`[❌ FIRESTORE ROOM ERROR] Failed to clean room ${roomId}:`, error);
+    console.log(`[❌ FIRESTORE ERROR] Failed to clean room ${roomId}:`, error);
   }
 }
 
@@ -69,20 +72,22 @@ io.on('connection', (socket) => {
       const user = activeUsers.get(socket.id);
       user.inQueue = data.inQueue;
       if (data.email) user.email = data.email;
-      console.log(`[🎯 QUEUE STATUS] ${user.email} is ${data.inQueue ? 'Searching' : 'Not Searching'}`);
+      console.log(`[🎯 QUEUE] ${user.email} is ${data.inQueue ? 'Searching' : 'Idle'}`);
     }
   });
 
   socket.on('set_room_status', (data) => {
     if (activeUsers.has(socket.id)) {
       activeUsers.get(socket.id).roomId = data.roomId;
-      console.log(`[📞 ROOM STATUS] User joined room: ${data.roomId}`);
+      if (data.roomId) {
+        console.log(`[📞 ROOM] Socket ${socket.id} joined Room ID: ${data.roomId}`);
+      }
     }
   });
 
   // 🚀 SOCKET LISTENER: TRIGGERED INSTANTLY BY CLIENT ON END/NEXT/BACKGROUND
   socket.on('destroy_room', async ({ roomId }) => {
-    console.log(`[🗑️ DESTROY ROOM COMMAND] Received command to delete room: ${roomId}`);
+    console.log(`[⚡ URGENT] Client requested immediate destruction of Room: ${roomId}`);
     await forceWipeRoom(roomId);
   });
 
@@ -99,12 +104,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('manual_disconnect', async () => {
-    console.log(`[⚠️ MANUAL DISCONNECT] Socket ${socket.id} intentionally dropped.`);
+    console.log(`[⚠️ APP BACKGROUND] Socket ${socket.id} intentionally dropped.`);
     await handleUserDrop(socket.id, 'App Backgrounded/Closed');
   });
 
   socket.on('disconnect', () => {
-    console.log(`[🔌 DISCONNECTED] Socket ID: ${socket.id}`);
+    console.log(`[🔌 DISCONNECTED] Socket ID: ${socket.id} lost connection.`);
     handleUserDrop(socket.id, 'Socket Connection Lost');
   });
 });
@@ -112,6 +117,7 @@ io.on('connection', (socket) => {
 setInterval(async () => {
   const now = Date.now();
   for (const [socketId, user] of activeUsers.entries()) {
+    // 15s server timeout buffer allows client 10s network switch to function properly
     const timeoutThreshold = user.isWatchingAd ? 120000 : 15000; 
     if (now - user.lastPing > timeoutThreshold) {
       console.log(`[🕒 TIMEOUT] User ${user.email || user.uid} missed pings for over ${timeoutThreshold/1000}s`);
@@ -124,14 +130,14 @@ setInterval(async () => {
 async function handleUserDrop(socketId, reason) {
   if (activeUsers.has(socketId)) {
     const user = activeUsers.get(socketId);
-    console.log(`[🛑 DROPPING USER] ${user.email || user.uid} | Reason: ${reason}`);
+    console.log(`[🛑 DROPPING] ${user.email || user.uid} | Reason: ${reason}`);
 
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (error) {}
 
     if (user.email && user.inQueue) {
       try { 
         await firestore.collection('randomQueue').doc(user.email).delete(); 
-        console.log(`[🔥 FIRESTORE] Deleted ${user.email} from randomQueue.`);
+        console.log(`[🔥 QUEUE] Deleted ${user.email} from queue.`);
       } catch (error) {}
     }
 
@@ -150,16 +156,13 @@ setInterval(async () => {
     if (snapshot.empty) return;
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0); 
-    let count = 0;
     for (const doc of snapshot.docs) {
       const data = doc.data();
       let docCreatedDate = data.createdAt?.toDate ? data.createdAt.toDate() : new Date(data.createdAt);
       if (docCreatedDate && docCreatedDate < todayStart) {
         await firestore.collection('randomQueue').doc(doc.id).delete();
-        count++;
       }
     }
-    if(count > 0) console.log(`[🧹 SWEEPER] Removed ${count} old queue entries.`);
   } catch (error) {}
 }, 30 * 60 * 1000);
 
