@@ -7,7 +7,6 @@ const admin = require('firebase-admin');
 // ==========================================
 // 🔑 DUAL FIREBASE ADMIN INITIALIZATION
 // ==========================================
-
 const rtdbServiceAccount = require('./serviceAccountKey.json');
 const rtdbApp = admin.initializeApp({
    credential: admin.credential.cert(rtdbServiceAccount),
@@ -20,7 +19,6 @@ const firestoreApp = admin.initializeApp({
   credential: admin.credential.cert(firestoreServiceAccount)
 }, 'firestoreApp');
 const firestore = firestoreApp.firestore();
-
 
 const app = express();
 app.use(cors());
@@ -49,7 +47,7 @@ async function forceWipeRoom(roomId) {
     await batch.commit();
     await roomRef.delete();
     
-    console.log(`[📞 FIRESTORE] Instantly wiped Room ID: ${roomId} and all subcollections!`);
+    console.log(`[📞 FIRESTORE] Instantly wiped Room ID: ${roomId} and all candidates!`);
   } catch (error) {
     console.log(`[❌ FIRESTORE ROOM ERROR] Failed to clean room ${roomId}:`, error);
   }
@@ -62,6 +60,7 @@ io.on('connection', (socket) => {
     const { uid, email, screen } = data;
     if (!uid) return;
     activeUsers.set(socket.id, { uid, email, screen, lastPing: Date.now(), isWatchingAd: false, inQueue: false, roomId: null });
+    console.log(`[👤 REGISTERED] Email: ${email} | Screen: ${screen}`);
     try { await rtdb.ref(`users/${uid}`).update({ IsActive: true }); } catch (error) {}
   });
 
@@ -70,17 +69,20 @@ io.on('connection', (socket) => {
       const user = activeUsers.get(socket.id);
       user.inQueue = data.inQueue;
       if (data.email) user.email = data.email;
+      console.log(`[🎯 QUEUE STATUS] ${user.email} is ${data.inQueue ? 'Searching' : 'Not Searching'}`);
     }
   });
 
   socket.on('set_room_status', (data) => {
     if (activeUsers.has(socket.id)) {
       activeUsers.get(socket.id).roomId = data.roomId;
+      console.log(`[📞 ROOM STATUS] User joined room: ${data.roomId}`);
     }
   });
 
   // 🚀 SOCKET LISTENER: TRIGGERED INSTANTLY BY CLIENT ON END/NEXT/BACKGROUND
   socket.on('destroy_room', async ({ roomId }) => {
+    console.log(`[🗑️ DESTROY ROOM COMMAND] Received command to delete room: ${roomId}`);
     await forceWipeRoom(roomId);
   });
 
@@ -97,10 +99,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('manual_disconnect', async () => {
+    console.log(`[⚠️ MANUAL DISCONNECT] Socket ${socket.id} intentionally dropped.`);
     await handleUserDrop(socket.id, 'App Backgrounded/Closed');
   });
 
   socket.on('disconnect', () => {
+    console.log(`[🔌 DISCONNECTED] Socket ID: ${socket.id}`);
     handleUserDrop(socket.id, 'Socket Connection Lost');
   });
 });
@@ -110,6 +114,7 @@ setInterval(async () => {
   for (const [socketId, user] of activeUsers.entries()) {
     const timeoutThreshold = user.isWatchingAd ? 120000 : 15000; 
     if (now - user.lastPing > timeoutThreshold) {
+      console.log(`[🕒 TIMEOUT] User ${user.email || user.uid} missed pings for over ${timeoutThreshold/1000}s`);
       await handleUserDrop(socketId, 'Missed Ping (Internet Drop / App Killed)');
       io.to(socketId).emit('force_disconnect');
     }
@@ -124,7 +129,10 @@ async function handleUserDrop(socketId, reason) {
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (error) {}
 
     if (user.email && user.inQueue) {
-      try { await firestore.collection('randomQueue').doc(user.email).delete(); } catch (error) {}
+      try { 
+        await firestore.collection('randomQueue').doc(user.email).delete(); 
+        console.log(`[🔥 FIRESTORE] Deleted ${user.email} from randomQueue.`);
+      } catch (error) {}
     }
 
     if (user.roomId) {
@@ -142,13 +150,16 @@ setInterval(async () => {
     if (snapshot.empty) return;
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0); 
+    let count = 0;
     for (const doc of snapshot.docs) {
       const data = doc.data();
       let docCreatedDate = data.createdAt?.toDate ? data.createdAt.toDate() : new Date(data.createdAt);
       if (docCreatedDate && docCreatedDate < todayStart) {
         await firestore.collection('randomQueue').doc(doc.id).delete();
+        count++;
       }
     }
+    if(count > 0) console.log(`[🧹 SWEEPER] Removed ${count} old queue entries.`);
   } catch (error) {}
 }, 30 * 60 * 1000);
 
