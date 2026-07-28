@@ -13,12 +13,12 @@ const rtdbApp = admin.initializeApp({
   databaseURL: "https://testvibe-cc69f-default-rtdb.firebaseio.com" // ⚠️ REPLACE WITH YOUR RTDB URL
 }, 'rtdbApp');
 const rtdb = rtdbApp.database();
-
 const firestoreServiceAccount = require('./videoChatfirestoreServiceAccountKey.json');
 const firestoreApp = admin.initializeApp({
   credential: admin.credential.cert(firestoreServiceAccount)
 }, 'firestoreApp');
 const firestore = firestoreApp.firestore();
+
 
 const app = express();
 app.use(cors());
@@ -28,42 +28,37 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 
 const activeUsers = new Map();
 
-// 🚀 CORE FUNCTION: INSTANTLY WIPES ROOM & SUBCOLLECTIONS COMPLETELY FOR BOTH USERS
-async function forceWipeRoom(roomId, triggerMethod) {
+// 🚀 CORE FUNCTION: SERVER WIPES ROOM & COLLECTIONS INSTANTLY
+async function forceWipeRoom(roomId) {
   if (!roomId) return;
   try {
-    console.log(`\n[🗑️ SERVER WIPE TRIGGERED] Method: ${triggerMethod} | Room ID: ${roomId}`);
     const roomRef = firestore.collection('room').doc(roomId);
     const batch = firestore.batch();
 
-    // 1. Delete all callerCandidates
+    // Remove all callerCandidates
     const callerCands = await roomRef.collection('callerCandidates').get();
-    let callerCount = 0;
-    callerCands.forEach(doc => { batch.delete(doc.ref); callerCount++; });
+    callerCands.forEach(doc => batch.delete(doc.ref));
 
-    // 2. Delete all calleeCandidates
+    // Remove all calleeCandidates
     const calleeCands = await roomRef.collection('calleeCandidates').get();
-    let calleeCount = 0;
-    calleeCands.forEach(doc => { batch.delete(doc.ref); calleeCount++; });
+    calleeCands.forEach(doc => batch.delete(doc.ref));
 
-    // 3. Execute batch & delete main document
+    // Execute batch & delete main document
     await batch.commit();
     await roomRef.delete();
     
-    console.log(`[✅ FIRESTORE WIPE SUCCESS] Deleted Room ${roomId} | Caller Candidates: ${callerCount} | Callee Candidates: ${calleeCount}\n`);
+    console.log(`[✅ FIRESTORE WIPE] Successfully deleted Room ${roomId} and all collections!`);
   } catch (error) {
     console.log(`[❌ FIRESTORE ERROR] Failed to clean room ${roomId}:`, error);
   }
 }
 
 io.on('connection', (socket) => {
-  console.log(`[🔌 NEW CONNECTION] Socket ID: ${socket.id}`);
 
   socket.on('register_user', async (data) => {
     const { uid, email, screen } = data;
     if (!uid) return;
     activeUsers.set(socket.id, { uid, email, screen, lastPing: Date.now(), isWatchingAd: false, inQueue: false, roomId: null });
-    console.log(`[👤 REGISTERED] Email: ${email}`);
     try { await rtdb.ref(`users/${uid}`).update({ IsActive: true }); } catch (error) {}
   });
 
@@ -77,25 +72,43 @@ io.on('connection', (socket) => {
 
   socket.on('set_room_status', (data) => {
     if (activeUsers.has(socket.id)) {
-      activeUsers.get(socket.id).roomId = data.roomId;
+      const user = activeUsers.get(socket.id);
+      if (user.roomId) socket.leave(user.roomId); // Leave previous room
+      user.roomId = data.roomId;
+      if (data.roomId) socket.join(data.roomId); // Join specific socket room for P2P alerts
     }
   });
 
-  // 🚀 THE 4 REQUESTED METHODS FOR INSTANT CLEANUP
+  // ==========================================
+  // 🚀 1. USER CLICKED END BUTTON
+  // ==========================================
   socket.on('videoend', async ({ roomId }) => {
-    await forceWipeRoom(roomId, 'videoend');
+    socket.to(roomId).emit('call_alert', { title: "Call ended", message: "User has End the call" });
+    await forceWipeRoom(roomId);
   });
 
+  // ==========================================
+  // 🚀 2. USER CLICKED NEXT BUTTON
+  // ==========================================
   socket.on('videonext', async ({ roomId }) => {
-    await forceWipeRoom(roomId, 'videonext');
+    socket.to(roomId).emit('call_alert', { title: "Stranger left", message: "User is looking someone else" });
+    await forceWipeRoom(roomId);
   });
 
+  // ==========================================
+  // 🚀 3. USER GOES TO BACKGROUND / KILLS APP
+  // ==========================================
   socket.on('videobackground', async ({ roomId }) => {
-    await forceWipeRoom(roomId, 'videobackground');
+    socket.to(roomId).emit('call_alert', { title: "Call ended", message: "User has End the call" });
+    await forceWipeRoom(roomId);
   });
 
+  // ==========================================
+  // 🚀 4. USER LOST INTERNET
+  // ==========================================
   socket.on('checkInternet', async ({ roomId }) => {
-    await forceWipeRoom(roomId, 'checkInternet');
+    socket.to(roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
+    await forceWipeRoom(roomId);
   });
 
   socket.on('ping', () => {
@@ -111,12 +124,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('manual_disconnect', async () => {
-    console.log(`[⚠️ APP BACKGROUND] Socket ${socket.id} intentionally dropped.`);
     await handleUserDrop(socket.id, 'App Backgrounded/Closed');
   });
 
   socket.on('disconnect', () => {
-    console.log(`[🔌 DISCONNECTED] Socket ID: ${socket.id} lost connection.`);
     handleUserDrop(socket.id, 'Socket Connection Lost');
   });
 });
@@ -126,7 +137,6 @@ setInterval(async () => {
   for (const [socketId, user] of activeUsers.entries()) {
     const timeoutThreshold = user.isWatchingAd ? 120000 : 15000; 
     if (now - user.lastPing > timeoutThreshold) {
-      console.log(`[🕒 TIMEOUT] User ${user.email || user.uid} missed pings for over ${timeoutThreshold/1000}s`);
       await handleUserDrop(socketId, 'Missed Ping');
       io.to(socketId).emit('force_disconnect');
     }
@@ -136,7 +146,6 @@ setInterval(async () => {
 async function handleUserDrop(socketId, reason) {
   if (activeUsers.has(socketId)) {
     const user = activeUsers.get(socketId);
-    console.log(`[🛑 DROPPING] ${user.email || user.uid} | Reason: ${reason}`);
 
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (error) {}
 
@@ -145,7 +154,9 @@ async function handleUserDrop(socketId, reason) {
     }
 
     if (user.roomId) {
-      await forceWipeRoom(user.roomId, 'Server User Drop Detection');
+      // Server fallback if user entirely dropped without warning
+      io.to(user.roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
+      await forceWipeRoom(user.roomId);
     }
 
     activeUsers.delete(socketId);
