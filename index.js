@@ -27,109 +27,93 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 
 const activeUsers = new Map();
 
-// 🚀 SERVER FUNCTION: INSTANTLY WIPES ROOM & ALL CANDIDATES FROM FIRESTORE
+// 🚀 CORE FUNCTION: AGGRESSIVE DB WIPE WITH PROMISES (FIXES GHOST DATA)
 async function forceWipeRoom(roomId, triggerMethod) {
   if (!roomId) return;
   try {
-    console.log(`\n[🗑️ FIRESTORE WIPE] Trigger: ${triggerMethod} | Room ID: ${roomId}`);
+    console.log(`\n[🗑️ SERVER WIPE TRIGGERED] Method: ${triggerMethod} | Room ID: ${roomId}`);
     const roomRef = firestore.collection('room').doc(roomId);
-    const batch = firestore.batch();
+    
+    // Use individual promises instead of a batch to prevent silent Firebase failures
+    const deletePromises = [];
 
-    // 1. Delete all callerCandidates
+    // 1. Queue all callerCandidates for deletion
     const callerCands = await roomRef.collection('callerCandidates').get();
-    let callerCount = 0;
-    callerCands.forEach(doc => { batch.delete(doc.ref); callerCount++; });
+    callerCands.forEach(doc => deletePromises.push(doc.ref.delete()));
 
-    // 2. Delete all calleeCandidates
+    // 2. Queue all calleeCandidates for deletion
     const calleeCands = await roomRef.collection('calleeCandidates').get();
-    let calleeCount = 0;
-    calleeCands.forEach(doc => { batch.delete(doc.ref); calleeCount++; });
+    calleeCands.forEach(doc => deletePromises.push(doc.ref.delete()));
 
-    // 3. Commit batch & delete room document
-    await batch.commit();
+    // 3. Wait for all subcollections to be completely wiped
+    await Promise.all(deletePromises);
+    
+    // 4. Finally, delete the main room document
     await roomRef.delete();
     
-    console.log(`[✅ WIPE SUCCESS] Room ${roomId} wiped! (callerCandidates: ${callerCount}, calleeCandidates: ${calleeCount})\n`);
+    console.log(`[✅ FIRESTORE WIPE SUCCESS] Completely eradicated Room ${roomId} and all collections.\n`);
   } catch (error) {
-    console.log(`[❌ WIPE ERROR] Failed to clean room ${roomId}:`, error.message);
+    console.log(`[❌ FIRESTORE ERROR] Failed to clean room ${roomId}:`, error);
   }
 }
 
 io.on('connection', (socket) => {
   console.log(`[🔌 NEW CONNECTION] Socket ID: ${socket.id}`);
 
-  // 1. Register User
   socket.on('register_user', async (data) => {
     const { uid, email, screen } = data;
     if (!uid) return;
     activeUsers.set(socket.id, { uid, email, screen, lastPing: Date.now(), isWatchingAd: false, inQueue: false, roomId: null });
-    console.log(`[👤 USER REGISTERED] Email: ${email} | Socket: ${socket.id} | Screen: ${screen}`);
     try { await rtdb.ref(`users/${uid}`).update({ IsActive: true }); } catch (error) {}
   });
 
-  // 2. Queue Status Update
   socket.on('set_queue_status', (data) => {
     if (activeUsers.has(socket.id)) {
       const user = activeUsers.get(socket.id);
       user.inQueue = data.inQueue;
       if (data.email) user.email = data.email;
-      console.log(`[🎯 QUEUE STATUS] ${user.email || socket.id} is ${data.inQueue ? 'Searching in Queue' : 'Idle'}`);
     }
   });
 
-  // 3. Room Status Update (Joins Socket Room)
   socket.on('set_room_status', (data) => {
     if (activeUsers.has(socket.id)) {
       const user = activeUsers.get(socket.id);
       if (user.roomId) socket.leave(user.roomId); 
       user.roomId = data.roomId;
-      if (data.roomId) {
-        socket.join(data.roomId);
-        console.log(`[📞 ROOM JOINED] ${user.email || socket.id} joined Socket Room: ${data.roomId}`);
-      }
+      if (data.roomId) socket.join(data.roomId); // Join room so server can broadcast directly to them
     }
   });
 
   // ==============================================================
-  // 🚀 METHOD 1: END BUTTON CLICKED
+  // 🚀 1. USER CLICKS END BUTTON (Waits 1.5s for alerts to send)
   // ==============================================================
-  socket.on('videoend', async ({ roomId }) => {
-    console.log(`[🛑 SOCKET EVENT] 'videoend' received for Room: ${roomId}`);
+  socket.on('videoend', ({ roomId }) => {
     socket.to(roomId).emit('call_alert', { title: "Call ended", message: "User has End the call" });
-    await forceWipeRoom(roomId, 'videoend');
+    setTimeout(() => forceWipeRoom(roomId, 'videoend'), 1500); 
   });
 
   // ==============================================================
-  // 🚀 METHOD 2: NEXT BUTTON CLICKED
+  // 🚀 2. USER CLICKS NEXT BUTTON
   // ==============================================================
-  socket.on('videonext', async ({ roomId }) => {
-    console.log(`[⏭️ SOCKET EVENT] 'videonext' received for Room: ${roomId}`);
+  socket.on('videonext', ({ roomId }) => {
     socket.to(roomId).emit('call_alert', { title: "Stranger left", message: "User is looking someone else" });
-    await forceWipeRoom(roomId, 'videonext');
+    setTimeout(() => forceWipeRoom(roomId, 'videonext'), 1500);
   });
 
   // ==============================================================
-  // 🚀 METHOD 3: GOES TO BACKGROUND OR KILLS APP
+  // 🚀 3. USER GOES TO BACKGROUND OR KILLS APP
   // ==============================================================
-  socket.on('videobackground', async ({ roomId }) => {
-    console.log(`[📱 SOCKET EVENT] 'videobackground' received for Room: ${roomId}`);
+  socket.on('videobackground', ({ roomId }) => {
     socket.to(roomId).emit('call_alert', { title: "Call ended", message: "User has End the call" });
-    await forceWipeRoom(roomId, 'videobackground');
+    setTimeout(() => forceWipeRoom(roomId, 'videobackground'), 1500);
   });
 
   // ==============================================================
-  // 🚀 METHOD 4: INTERNET LOST / NETWORK SWITCHED
+  // 🚀 4. USER LOST INTERNET
   // ==============================================================
-  socket.on('checkInternet', async ({ roomId }) => {
-    console.log(`[📶 SOCKET EVENT] 'checkInternet' received for Room: ${roomId}`);
-    socket.to(roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
-    await forceWipeRoom(roomId, 'checkInternet');
-  });
-
-  // Manual destroy fallback
-  socket.on('destroy_room', async ({ roomId }) => {
-    console.log(`[⚡ SOCKET EVENT] 'destroy_room' fallback for Room: ${roomId}`);
-    await forceWipeRoom(roomId, 'destroy_room');
+  socket.on('checkInternet', ({ roomId }) => {
+    socket.to(roomId).emit('call_alert', { title: "Connection Lost", message: "User has lost the connection" });
+    setTimeout(() => forceWipeRoom(roomId, 'checkInternet'), 1500);
   });
 
   socket.on('ping', () => {
@@ -141,35 +125,32 @@ io.on('connection', (socket) => {
       const user = activeUsers.get(socket.id);
       user.isWatchingAd = data.isWatchingAd;
       user.lastPing = Date.now();
-      console.log(`[📺 AD STATUS] ${user.email || socket.id} is Watching Ad: ${data.isWatchingAd}`);
     }
   });
 
   socket.on('manual_disconnect', async () => {
-    console.log(`[⚠️ MANUAL DISCONNECT] Socket: ${socket.id}`);
-    await handleUserDrop(socket.id, 'App Backgrounded/Closed');
+    await handleUserDrop(socket.id);
   });
 
   socket.on('disconnect', () => {
-    console.log(`[🔌 SOCKET DISCONNECTED] ID: ${socket.id}`);
-    handleUserDrop(socket.id, 'Socket Connection Lost');
+    handleUserDrop(socket.id);
   });
 });
 
-// 🚀 4-SECOND PING MONITORING LOOP (For Forced App Kills)
+// 🚀 4-SECOND PING CHECKER FOR KILLED APPS
 setInterval(async () => {
   const now = Date.now();
   for (const [socketId, user] of activeUsers.entries()) {
-    const timeoutThreshold = user.isWatchingAd ? 120000 : 8000; // 8s threshold allows exactly 1 missed ping
+    const timeoutThreshold = user.isWatchingAd ? 120000 : 8000; 
     if (now - user.lastPing > timeoutThreshold) {
-      console.log(`[🕒 PING TIMEOUT] User ${user.email || user.uid} missed pings for >${timeoutThreshold/1000}s`);
+      console.log(`[🕒 TIMEOUT] User ${user.email || user.uid} missed pings for over ${timeoutThreshold/1000}s`);
       
       if (user.roomId) {
         io.to(user.roomId).emit('call_alert', { title: "Call ended", message: "User has End the call" });
-        await forceWipeRoom(user.roomId, 'Ping Timeout / App Killed');
+        setTimeout(() => forceWipeRoom(user.roomId, 'Server User Drop Detection'), 1500);
       }
 
-      await handleUserDrop(socketId, 'Missed Ping Timeout');
+      await handleUserDrop(socketId, 'Missed Ping (App Killed)');
       io.to(socketId).emit('force_disconnect');
     }
   }
@@ -178,66 +159,31 @@ setInterval(async () => {
 async function handleUserDrop(socketId, reason) {
   if (activeUsers.has(socketId)) {
     const user = activeUsers.get(socketId);
-    console.log(`[🛑 DROPPING USER] ${user.email || user.uid} | Reason: ${reason}`);
-
+    console.log(`[🛑 DROPPING] ${user.email || user.uid} | Reason: ${reason}`);
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (error) {}
-
     if (user.email && user.inQueue) {
-      try { 
-        await firestore.collection('randomQueue').doc(user.email).delete(); 
-        console.log(`[🔥 QUEUE CLEANUP] Removed ${user.email} from randomQueue.`);
-      } catch (error) {}
+      try { await firestore.collection('randomQueue').doc(user.email).delete(); } catch (error) {}
     }
-
     activeUsers.delete(socketId);
   }
 }
 
-// 📅 1. STALE RANDOM QUEUE SWEEPER (Every 30 Minutes)
+// 📅 STALE QUEUE SWEEPER
 setInterval(async () => {
   try {
     const snapshot = await firestore.collection('randomQueue').get();
     if (snapshot.empty) return;
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0); 
-    let cleaned = 0;
     for (const doc of snapshot.docs) {
       const data = doc.data();
       let docCreatedDate = data.createdAt?.toDate ? data.createdAt.toDate() : new Date(data.createdAt);
       if (docCreatedDate && docCreatedDate < todayStart) {
         await firestore.collection('randomQueue').doc(doc.id).delete();
-        cleaned++;
       }
     }
-    if (cleaned > 0) console.log(`[🧹 QUEUE SWEEPER] Cleaned ${cleaned} stale queue records.`);
   } catch (error) {}
 }, 30 * 60 * 1000);
-
-// 💎 2. TOTAL SUBSCRIPTION SWEEPER (Every 1 Minute)
-setInterval(async () => {
-  try {
-    const snap = await rtdb.ref('TotalSubscriptions').once('value');
-    if (!snap.exists()) return;
-    const subscriptions = snap.val();
-    const now = new Date(); 
-    let expiredCount = 0;
-    for (const [dateKey, subData] of Object.entries(subscriptions)) {
-      const parts = dateKey.split('-');
-      if (parts.length >= 7) {
-        const expDate = new Date(parts[2], parts[1]-1, parts[0], parts[3], parts[4], parts[5], parts[6]);
-        if (expDate <= now) {
-          if (subData.userId) {
-            await rtdb.ref(`users/${subData.userId}/Subscription`).remove();
-            await rtdb.ref(`users/${subData.userId}`).update({ IsVip: false }); 
-          }
-          await rtdb.ref(`TotalSubscriptions/${dateKey}`).remove();
-          expiredCount++;
-        }
-      }
-    }
-    if (expiredCount > 0) console.log(`[💎 SUBSCRIPTION SWEEPER] Processed & expired ${expiredCount} subscriptions.`);
-  } catch (error) {}
-}, 60000); 
 
 app.get('/', (req, res) => res.send('MeetVibe Server Running 🚀'));
 const PORT = process.env.PORT || 3000;
