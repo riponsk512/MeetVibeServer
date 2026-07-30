@@ -27,33 +27,41 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 
 const activeUsers = new Map();
 
-// 🚀 CORE FUNCTION: AGGRESSIVE DB WIPE WITH PROMISES (FIXES GHOST DATA)
+// 🚀 BULLETPROOF DATABASE WIPE (Removes Room + All Subcollections)
 async function forceWipeRoom(roomId, triggerMethod) {
   if (!roomId) return;
   try {
-    console.log(`\n[🗑️ SERVER WIPE TRIGGERED] Method: ${triggerMethod} | Room ID: ${roomId}`);
+    console.log(`\n[🗑️ DB WIPE STARTED] Trigger: ${triggerMethod} | Room: ${roomId}`);
     const roomRef = firestore.collection('room').doc(roomId);
-    
-    // Use individual promises instead of a batch to prevent silent Firebase failures
+
+    // Using Promise.all instead of Batch to prevent silent failures
     const deletePromises = [];
 
-    // 1. Queue all callerCandidates for deletion
+    // 1. Fetch & Destroy Caller Candidates
     const callerCands = await roomRef.collection('callerCandidates').get();
-    callerCands.forEach(doc => deletePromises.push(doc.ref.delete()));
+    let callerCount = 0;
+    callerCands.forEach(doc => {
+      deletePromises.push(doc.ref.delete());
+      callerCount++;
+    });
 
-    // 2. Queue all calleeCandidates for deletion
+    // 2. Fetch & Destroy Callee Candidates
     const calleeCands = await roomRef.collection('calleeCandidates').get();
-    calleeCands.forEach(doc => deletePromises.push(doc.ref.delete()));
+    let calleeCount = 0;
+    calleeCands.forEach(doc => {
+      deletePromises.push(doc.ref.delete());
+      calleeCount++;
+    });
 
-    // 3. Wait for all subcollections to be completely wiped
+    // 3. Wait for all subcollection documents to be entirely deleted
     await Promise.all(deletePromises);
     
-    // 4. Finally, delete the main room document
+    // 4. Finally delete the parent room
     await roomRef.delete();
     
-    console.log(`[✅ FIRESTORE WIPE SUCCESS] Completely eradicated Room ${roomId} and all collections.\n`);
+    console.log(`[✅ WIPE SUCCESS] Eradicated Room ${roomId}! (CallerCands: ${callerCount}, CalleeCands: ${calleeCount})\n`);
   } catch (error) {
-    console.log(`[❌ FIRESTORE ERROR] Failed to clean room ${roomId}:`, error);
+    console.log(`[❌ WIPE ERROR] Failed to clean room ${roomId}:`, error.message);
   }
 }
 
@@ -64,6 +72,7 @@ io.on('connection', (socket) => {
     const { uid, email, screen } = data;
     if (!uid) return;
     activeUsers.set(socket.id, { uid, email, screen, lastPing: Date.now(), isWatchingAd: false, inQueue: false, roomId: null });
+    console.log(`[👤 ONLINE] Email: ${email} | Socket: ${socket.id}`);
     try { await rtdb.ref(`users/${uid}`).update({ IsActive: true }); } catch (error) {}
   });
 
@@ -80,40 +89,47 @@ io.on('connection', (socket) => {
       const user = activeUsers.get(socket.id);
       if (user.roomId) socket.leave(user.roomId); 
       user.roomId = data.roomId;
-      if (data.roomId) socket.join(data.roomId); // Join room so server can broadcast directly to them
+      if (data.roomId) {
+        socket.join(data.roomId); // Join specific room for alerts
+        console.log(`[📞 ROOM JOINED] Socket ${socket.id} joined Room: ${data.roomId}`);
+      }
     }
   });
 
-  // ==============================================================
-  // 🚀 1. USER CLICKS END BUTTON (Waits 1.5s for alerts to send)
-  // ==============================================================
-  socket.on('videoend', ({ roomId }) => {
-    socket.to(roomId).emit('call_alert', { title: "Call ended", message: "User has End the call" });
-    setTimeout(() => forceWipeRoom(roomId, 'videoend'), 1500); 
+  // =========================================================
+  // 🚀 1. USER CLICKED END BUTTON
+  // =========================================================
+  socket.on('videoend', async ({ roomId }) => {
+    console.log(`[🛑 ACTION: END] Room: ${roomId}`);
+    socket.to(roomId).emit('call_alert', { title: "Call ended", message: "The user has ended the call" });
+    await forceWipeRoom(roomId, 'videoend');
   });
 
-  // ==============================================================
-  // 🚀 2. USER CLICKS NEXT BUTTON
-  // ==============================================================
-  socket.on('videonext', ({ roomId }) => {
-    socket.to(roomId).emit('call_alert', { title: "Stranger left", message: "User is looking someone else" });
-    setTimeout(() => forceWipeRoom(roomId, 'videonext'), 1500);
+  // =========================================================
+  // 🚀 2. USER CLICKED NEXT BUTTON
+  // =========================================================
+  socket.on('videonext', async ({ roomId }) => {
+    console.log(`[⏭️ ACTION: NEXT] Room: ${roomId}`);
+    socket.to(roomId).emit('call_alert', { title: "Stranger left", message: "User is looking for someone else" });
+    await forceWipeRoom(roomId, 'videonext');
   });
 
-  // ==============================================================
+  // =========================================================
   // 🚀 3. USER GOES TO BACKGROUND OR KILLS APP
-  // ==============================================================
-  socket.on('videobackground', ({ roomId }) => {
-    socket.to(roomId).emit('call_alert', { title: "Call ended", message: "User has End the call" });
-    setTimeout(() => forceWipeRoom(roomId, 'videobackground'), 1500);
+  // =========================================================
+  socket.on('videobackground', async ({ roomId }) => {
+    console.log(`[📱 ACTION: BACKGROUND] Room: ${roomId}`);
+    socket.to(roomId).emit('call_alert', { title: "Call ended", message: "The user has ended the call" });
+    await forceWipeRoom(roomId, 'videobackground');
   });
 
-  // ==============================================================
+  // =========================================================
   // 🚀 4. USER LOST INTERNET
-  // ==============================================================
-  socket.on('checkInternet', ({ roomId }) => {
-    socket.to(roomId).emit('call_alert', { title: "Connection Lost", message: "User has lost the connection" });
-    setTimeout(() => forceWipeRoom(roomId, 'checkInternet'), 1500);
+  // =========================================================
+  socket.on('checkInternet', async ({ roomId }) => {
+    console.log(`[📶 ACTION: NO INTERNET] Room: ${roomId}`);
+    socket.to(roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
+    await forceWipeRoom(roomId, 'checkInternet');
   });
 
   socket.on('ping', () => {
@@ -129,37 +145,39 @@ io.on('connection', (socket) => {
   });
 
   socket.on('manual_disconnect', async () => {
+    console.log(`[⚠️ APP KILLED/BACKGROUND] Socket: ${socket.id}`);
     await handleUserDrop(socket.id);
   });
 
   socket.on('disconnect', () => {
+    console.log(`[🔌 DISCONNECTED] ID: ${socket.id}`);
     handleUserDrop(socket.id);
   });
 });
 
-// 🚀 4-SECOND PING CHECKER FOR KILLED APPS
+// 🚀 4-SECOND PING CHECKER (Triggers if app is killed entirely)
 setInterval(async () => {
   const now = Date.now();
   for (const [socketId, user] of activeUsers.entries()) {
-    const timeoutThreshold = user.isWatchingAd ? 120000 : 8000; 
+    const timeoutThreshold = user.isWatchingAd ? 120000 : 15000; 
     if (now - user.lastPing > timeoutThreshold) {
-      console.log(`[🕒 TIMEOUT] User ${user.email || user.uid} missed pings for over ${timeoutThreshold/1000}s`);
+      console.log(`[🕒 PING TIMEOUT] User ${user.email || user.uid} dropped.`);
       
+      // If they had a room and the ping died (App Killed), tell the other user!
       if (user.roomId) {
-        io.to(user.roomId).emit('call_alert', { title: "Call ended", message: "User has End the call" });
-        setTimeout(() => forceWipeRoom(user.roomId, 'Server User Drop Detection'), 1500);
+        io.to(user.roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
+        await forceWipeRoom(user.roomId, 'Server Ping Timeout');
       }
 
-      await handleUserDrop(socketId, 'Missed Ping (App Killed)');
+      await handleUserDrop(socketId);
       io.to(socketId).emit('force_disconnect');
     }
   }
 }, 4000);
 
-async function handleUserDrop(socketId, reason) {
+async function handleUserDrop(socketId) {
   if (activeUsers.has(socketId)) {
     const user = activeUsers.get(socketId);
-    console.log(`[🛑 DROPPING] ${user.email || user.uid} | Reason: ${reason}`);
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (error) {}
     if (user.email && user.inQueue) {
       try { await firestore.collection('randomQueue').doc(user.email).delete(); } catch (error) {}
@@ -175,15 +193,44 @@ setInterval(async () => {
     if (snapshot.empty) return;
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0); 
+    let cleaned = 0;
     for (const doc of snapshot.docs) {
       const data = doc.data();
       let docCreatedDate = data.createdAt?.toDate ? data.createdAt.toDate() : new Date(data.createdAt);
       if (docCreatedDate && docCreatedDate < todayStart) {
         await firestore.collection('randomQueue').doc(doc.id).delete();
+        cleaned++;
       }
     }
+    if (cleaned > 0) console.log(`[🧹 QUEUE SWEEPER] Cleaned ${cleaned} stale queue records.`);
   } catch (error) {}
 }, 30 * 60 * 1000);
+
+// 💎 SUBSCRIPTION SWEEPER
+setInterval(async () => {
+  try {
+    const snap = await rtdb.ref('TotalSubscriptions').once('value');
+    if (!snap.exists()) return;
+    const subscriptions = snap.val();
+    const now = new Date(); 
+    let expiredCount = 0;
+    for (const [dateKey, subData] of Object.entries(subscriptions)) {
+      const parts = dateKey.split('-');
+      if (parts.length >= 7) {
+        const expDate = new Date(parts[2], parts[1]-1, parts[0], parts[3], parts[4], parts[5], parts[6]);
+        if (expDate <= now) {
+          if (subData.userId) {
+            await rtdb.ref(`users/${subData.userId}/Subscription`).remove();
+            await rtdb.ref(`users/${subData.userId}`).update({ IsVip: false }); 
+          }
+          await rtdb.ref(`TotalSubscriptions/${dateKey}`).remove();
+          expiredCount++;
+        }
+      }
+    }
+    if (expiredCount > 0) console.log(`[💎 SUBSCRIPTION SWEEPER] Expired ${expiredCount} subscriptions.`);
+  } catch (error) {}
+}, 60000); 
 
 app.get('/', (req, res) => res.send('MeetVibe Server Running 🚀'));
 const PORT = process.env.PORT || 3000;
