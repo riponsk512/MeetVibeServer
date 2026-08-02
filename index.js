@@ -38,15 +38,17 @@ firestore.collection('EndRoomRequest').onSnapshot(snapshot => {
       const data = change.doc.data();
       console.log(`\n[🔥 HYBRID FALLBACK DETECTED] Action: '${data.action}' triggered by ${data.by} for Room: ${data.roomId}`);
       
-      // 1. Wipe the room
       await forceWipeRoom(data.roomId, `Firestore Hybrid Request (${data.action})`);
       
-      // 2. Alert the room just in case Socket/WebRTC failed
       let title = data.action === 'next' ? "Stranger left" : "Call ended";
       let msg = data.action === 'next' ? "User is looking for someone else" : "The user has ended the call";
+      if (data.action === 'disconnected') {
+        title = "Connection Lost ⚠️";
+        msg = "User has lost the connection";
+      }
+
       io.to(data.roomId).emit('call_alert', { title: title, message: msg });
       
-      // 3. Delete the request document so it doesn't process again
       try {
         await change.doc.ref.delete();
         console.log(`[🗑️ HYBRID CLEANUP] Deleted EndRoomRequest document for room ${data.roomId}`);
@@ -68,22 +70,15 @@ async function forceWipeRoom(roomId, triggerMethod) {
     const roomRef = firestore.collection('room').doc(roomId);
     const deletePromises = [];
 
-    console.log(`[🔍 DB SCAN] Fetching callerCandidates for room ${roomId}...`);
     const callerCands = await roomRef.collection('callerCandidates').get();
     let callerCount = 0;
     callerCands.forEach(doc => { deletePromises.push(doc.ref.delete()); callerCount++; });
-    console.log(`[📌 DB QUEUE] Queued ${callerCount} callerCandidates for deletion.`);
 
-    console.log(`[🔍 DB SCAN] Fetching calleeCandidates for room ${roomId}...`);
     const calleeCands = await roomRef.collection('calleeCandidates').get();
     let calleeCount = 0;
     calleeCands.forEach(doc => { deletePromises.push(doc.ref.delete()); calleeCount++; });
-    console.log(`[📌 DB QUEUE] Queued ${calleeCount} calleeCandidates for deletion.`);
 
-    console.log(`[⏳ DB ACTION] Executing Promise.all deletion for subcollections...`);
     await Promise.all(deletePromises);
-    
-    console.log(`[⏳ DB ACTION] Deleting main room document...`);
     await roomRef.delete();
     
     console.log(`[✅ WIPE SUCCESSFUL] Completely eradicated Room ${roomId} from Firestore!\n`);
@@ -122,14 +117,13 @@ io.on('connection', (socket) => {
       user.roomId = data.roomId;
       if (data.roomId) {
         socket.join(data.roomId); 
-        console.log(`[🚪 SOCKET ROOM JOINED] ${user.email} joined Socket Room: ${data.roomId}`);
       }
     }
   });
 
-  // 🚀 LOGGING: USER A & USER B SUCCESSFULLY JOINED
+  // 🚀 EXACT LOG YOU REQUESTED FOR JOINING
   socket.on('room_established', (data) => {
-    console.log(`\n[🎉 CONNECTION ESTABLISHED] ${data.userA} and ${data.userB} have joined ${data.roomId} room\n`);
+    console.log(`\n[🎉 CONNECTION ESTABLISHED] ${data.userA} and ${data.userB} join ${data.roomId}\n`);
   });
 
   // 🚀 HYBRID 2: SOCKET TRIGGERS
@@ -166,18 +160,17 @@ io.on('connection', (socket) => {
       const user = activeUsers.get(socket.id);
       user.isWatchingAd = data.isWatchingAd;
       user.lastPing = Date.now();
-      console.log(`[📺 AD STATUS] ${user.email} watching ad: ${data.isWatchingAd}`);
     }
   });
 
   socket.on('manual_disconnect', async () => {
     console.log(`[⚠️ MANUAL DISCONNECT] Socket ${socket.id} (App killed/backgrounded)`);
-    await handleUserDrop(socket.id);
+    await handleUserDrop(socket.id, 'App Backgrounded/Closed');
   });
 
-  socket.on('disconnect', () => {
-    console.log(`[🔌 SOCKET LOST] ID: ${socket.id}`);
-    handleUserDrop(socket.id);
+  socket.on('disconnect', async () => {
+    console.log(`[🔌 SOCKET LOST] ID: ${socket.id} (No Internet / Hard Crash)`);
+    await handleUserDrop(socket.id, 'Socket Disconnected');
   });
 });
 
@@ -187,31 +180,37 @@ io.on('connection', (socket) => {
 setInterval(async () => {
   const now = Date.now();
   for (const [socketId, user] of activeUsers.entries()) {
-    const timeoutThreshold = user.isWatchingAd ? 120000 : 20000; 
+    const timeoutThreshold = user.isWatchingAd ? 120000 : 12000; 
     if (now - user.lastPing > timeoutThreshold) {
-      console.log(`[🕒 PING DEAD] User ${user.email} timed out. Missing pings for >20s.`);
-      if (user.roomId) {
-        console.log(`[🚨 ALERTING PARTNER] Broadcasting disconnect to Room ${user.roomId}`);
-        io.to(user.roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
-        await forceWipeRoom(user.roomId, 'Server Ping Timeout');
-      }
-      await handleUserDrop(socketId);
+      console.log(`[🕒 PING DEAD] User ${user.email} timed out. Missing pings for >12s.`);
+      await handleUserDrop(socketId, 'Server Ping Timeout');
       io.to(socketId).emit('force_disconnect');
     }
   }
 }, 4000);
 
-async function handleUserDrop(socketId) {
+// 🚀 ULTIMATE DROP HANDLER: WIPES ROOM IF SOCKET DIES FROM NO INTERNET
+async function handleUserDrop(socketId, reason) {
   if (activeUsers.has(socketId)) {
     const user = activeUsers.get(socketId);
-    console.log(`[🧹 CLEANING USER DATA] Unregistering ${user.email}`);
+    console.log(`[🛑 DROPPING USER] ${user.email || user.uid} | Reason: ${reason}`);
+
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (error) {}
+
     if (user.email && user.inQueue) {
       try { 
         await firestore.collection('randomQueue').doc(user.email).delete(); 
         console.log(`[🔥 QUEUE CLEANED] Removed ${user.email} from RandomQueue.`);
       } catch (error) {}
     }
+
+    // 🚀 NEW: IF SOCKET DISCONNECTS WHILE IN A ROOM, WIPE IT INSTANTLY
+    if (user.roomId) {
+      console.log(`[🚨 INSTANT DROP FALLBACK] User disconnected abruptly. Wiping room ${user.roomId}`);
+      io.to(user.roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
+      await forceWipeRoom(user.roomId, `Socket Drop (${reason})`);
+    }
+
     activeUsers.delete(socketId);
   }
 }
