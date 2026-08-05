@@ -4,11 +4,11 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const admin = require('firebase-admin');
 
-// ==========================================
-// 🔑 DUAL FIREBASE ADMIN INITIALIZATION
-// ==========================================
 console.log("[⚙️ SYSTEM] Initializing Firebase Admin SDKs...");
 
+// ==========================================
+// 🔑 1. REALTIME DATABASE (Presence & Users)
+// ==========================================
 const rtdbServiceAccount = require('./serviceAccountKey.json');
 const rtdbApp = admin.initializeApp({
    credential: admin.credential.cert(rtdbServiceAccount),
@@ -20,6 +20,16 @@ const firestoreApp = admin.initializeApp({
   credential: admin.credential.cert(firestoreServiceAccount)
 }, 'firestoreApp');
 const firestore = firestoreApp.firestore();
+
+// ==========================================
+// 🔑 3. VOICE FIRESTORE (Voice Rooms & Queues)
+// ==========================================
+const voiceFirestoreServiceAccount = require('./voiceCallfirestoreServiceAccountKey.json');
+const voiceFirestoreApp = admin.initializeApp({
+  credential: admin.credential.cert(voiceFirestoreServiceAccount)
+}, 'voiceFirestoreApp');
+const voiceFirestore = voiceFirestoreApp.firestore();
+
 
 const app = express();
 app.use(cors());
@@ -39,8 +49,10 @@ firestore.collection('EndRoomRequest').onSnapshot(snapshot => {
       const data = change.doc.data();
       console.log(`\n[🔥 HYBRID FALLBACK DETECTED] Action: '${data.action}' triggered by ${data.by} for Room: ${data.roomId}`);
       
+      // 1. Wipe the room (Will automatically check both Video and Voice DBs)
       await forceWipeRoom(data.roomId, `Firestore Hybrid Request (${data.action})`);
       
+      // 2. Alert the room just in case Socket/WebRTC failed
       let title = data.action === 'next' ? "Stranger left" : "Call ended";
       let msg = data.action === 'next' ? "User is looking for someone else" : "The user has ended the call";
       
@@ -51,41 +63,58 @@ firestore.collection('EndRoomRequest').onSnapshot(snapshot => {
 
       io.to(data.roomId).emit('call_alert', { title: title, message: msg });
       
+      // 3. Delete the request document so it doesn't process again
       try {
         await change.doc.ref.delete();
-      } catch (err) { }
+        console.log(`[🗑️ HYBRID CLEANUP] Deleted EndRoomRequest document for room ${data.roomId}`);
+      } catch (err) {
+        console.log(`[❌ HYBRID ERROR] Failed to delete EndRoomRequest doc:`, err.message);
+      }
     }
   });
 });
 
 // ==============================================================
-// 🚀 CORE FUNCTION: AGGRESSIVE PROMISE-BASED WIPE
+// 🚀 CORE FUNCTION: CROSS-DATABASE AGGRESSIVE WIPE
 // ==============================================================
 async function forceWipeRoom(roomId, triggerMethod) {
   if (!roomId) return;
   console.log(`\n[🛠️ DB WIPE INITIATED] Source: ${triggerMethod} | Target Room: ${roomId}`);
   
-  try {
-    const roomRef = firestore.collection('room').doc(roomId);
-    const deletePromises = [];
+  // Dynamic function that accepts the target database
+  const wipeCollection = async (dbInstance, collectionName) => {
+      try {
+        const roomRef = dbInstance.collection(collectionName).doc(roomId);
+        const deletePromises = [];
+        let callerCount = 0;
+        let calleeCount = 0;
 
-    const callerCands = await roomRef.collection('callerCandidates').get();
-    let callerCount = 0;
-    callerCands.forEach(doc => { deletePromises.push(doc.ref.delete()); callerCount++; });
+        const callerCands = await roomRef.collection('callerCandidates').get();
+        callerCands.forEach(doc => { deletePromises.push(doc.ref.delete()); callerCount++; });
 
-    const calleeCands = await roomRef.collection('calleeCandidates').get();
-    let calleeCount = 0;
-    calleeCands.forEach(doc => { deletePromises.push(doc.ref.delete()); calleeCount++; });
+        const calleeCands = await roomRef.collection('calleeCandidates').get();
+        calleeCands.forEach(doc => { deletePromises.push(doc.ref.delete()); calleeCount++; });
 
-    await Promise.all(deletePromises);
-    
-    // Delete parent document (whether it officially exists or is an italic ghost)
-    await roomRef.delete();
-    
-    console.log(`[✅ WIPE SUCCESSFUL] Completely eradicated Room ${roomId} from Firestore! (Cleaned ${callerCount} caller / ${calleeCount} callee signals)\n`);
-  } catch (error) {
-    console.log(`[❌ WIPE FATAL ERROR] Failed to clean room ${roomId}:`, error.message);
-  }
+        await Promise.all(deletePromises);
+        
+        // Delete parent document (whether it officially exists or is an italic ghost)
+        await roomRef.delete();
+        
+        if (callerCount > 0 || calleeCount > 0) {
+            console.log(`[✅ WIPE SUCCESSFUL] Eradicated ${collectionName}/${roomId}! (Cleaned ${callerCount} caller / ${calleeCount} callee signals)`);
+        }
+      } catch (error) {
+        // Silent catch for the collection that doesn't hold this specific room
+      }
+  };
+
+  // 🚀 MAGIC: Run the wipe on BOTH databases simultaneously! 
+  await Promise.all([
+      wipeCollection(firestore, 'room'),               // Checks Video DB
+      wipeCollection(voiceFirestore, 'voiceroom')      // Checks Voice DB
+  ]);
+  
+  console.log(`[✅ WIPE OPERATION COMPLETED] Room ${roomId} safely processed.\n`);
 }
 
 // ==============================================================
@@ -161,6 +190,7 @@ io.on('connection', (socket) => {
       const user = activeUsers.get(socket.id);
       user.isWatchingAd = data.isWatchingAd;
       user.lastPing = Date.now();
+      console.log(`[📺 AD STATUS] ${user.email} watching ad: ${data.isWatchingAd}`);
     }
   });
 
@@ -205,8 +235,16 @@ async function handleUserDrop(socketId, reason) {
     
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (error) {}
     
+    // 🚀 DUAL-DATABASE QUEUE CLEANUP
     if (user.email && user.inQueue) {
-      try { await firestore.collection('randomQueue').doc(user.email).delete(); } catch (error) {}
+      try { 
+        // Attempt to remove from Original DB Video Queue
+        await firestore.collection('randomQueue').doc(user.email).delete(); 
+        // Attempt to remove from New DB Voice Queue
+        await voiceFirestore.collection('voicerandomQueue').doc(user.email).delete(); 
+        
+        console.log(`[🔥 QUEUE CLEANED] Removed ${user.email} from all Queues.`);
+      } catch (error) {}
     }
     
     activeUsers.delete(socketId);
@@ -214,77 +252,92 @@ async function handleUserDrop(socketId, reason) {
 }
 
 // ==============================================================
-// 👻 THE ULTIMATE GHOST ROOM SWEEPER (Every 15s)
+// 👻 THE ULTIMATE GHOST ROOM SWEEPER (DUAL DATABASE - Every 15s)
 // ==============================================================
 setInterval(async () => {
-  try {
-    // 🚀 MAGIC FIX: listDocuments() finds the hidden "Italic" ghost documents that .get() misses
-    const docRefs = await firestore.collection('room').listDocuments();
+  // Pass the specific database connection and collection name
+  const ghostSweeper = async (dbInstance, collectionName) => {
+      try {
+        const docRefs = await dbInstance.collection(collectionName).listDocuments();
 
-    for (const docRef of docRefs) {
-      const docSnap = await docRef.get();
+        for (const docRef of docRefs) {
+          const docSnap = await docRef.get();
 
-      // 👻 CASE 1: The document is an "Italic Ghost" (No data fields, but has subcollections)
-      if (!docSnap.exists) {
-         console.log(`\n[👻 ITALIC GHOST DETECTED] Found orphaned ghost room: ${docRef.id}`);
-         await forceWipeRoom(docRef.id, 'Italic Ghost Sweeper');
-         continue;
-      }
+          if (!docSnap.exists) {
+             console.log(`\n[👻 ITALIC GHOST DETECTED] Found orphaned ghost ${collectionName}: ${docRef.id}`);
+             await forceWipeRoom(docRef.id, 'Italic Ghost Sweeper');
+             continue;
+          }
 
-      // CASE 2: The document exists, check if users are still genuinely active
-      const data = docSnap.data();
-      const caller = data.caller;
-      const callee = data.callee;
-      
-      if (!caller || !callee) {
-          await forceWipeRoom(docRef.id, 'Malformed Room Sweeper');
-          continue;
-      }
+          const data = docSnap.data();
+          const caller = data.caller;
+          const callee = data.callee;
+          
+          if (!caller || !callee) {
+              await forceWipeRoom(docRef.id, 'Malformed Room Sweeper');
+              continue;
+          }
 
-      const isUserActive = async (email) => {
-         const q = rtdb.ref('users').orderByChild('email').equalTo(email);
-         const snap = await q.once('value');
-         if (!snap.exists()) return false;
-         const val = snap.val();
-         const uid = Object.keys(val)[0];
-         return val[uid].IsActive === true;
-      };
+          const isUserActive = async (email) => {
+             const q = rtdb.ref('users').orderByChild('email').equalTo(email);
+             const snap = await q.once('value');
+             if (!snap.exists()) return false;
+             const val = snap.val();
+             const uid = Object.keys(val)[0];
+             return val[uid].IsActive === true;
+          };
 
-      const callerActive = await isUserActive(caller);
-      const calleeActive = await isUserActive(callee);
+          const callerActive = await isUserActive(caller);
+          const calleeActive = await isUserActive(callee);
 
-      // If EITHER user's RTDB shows IsActive: false, WIPE THE ROOM INSTANTLY
-      if (!callerActive || !calleeActive) {
-         console.log(`\n[👻 INACTIVE USER DETECTED] Room ${docRef.id} contains a disconnected user.`);
-         io.to(docRef.id).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
-         await forceWipeRoom(docRef.id, 'Ghost Sweeper (IsActive == false)');
-      }
-    }
-  } catch (err) {}
+          if (!callerActive || !calleeActive) {
+             console.log(`\n[👻 INACTIVE USER DETECTED] ${collectionName} ${docRef.id} contains a disconnected user.`);
+             io.to(docRef.id).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
+             await forceWipeRoom(docRef.id, 'Ghost Sweeper (IsActive == false)');
+          }
+        }
+      } catch (err) {}
+  };
+
+  // 🚀 Sweep both Video (firestore) and Voice (voiceFirestore) simultaneously!
+  await ghostSweeper(firestore, 'room');
+  await ghostSweeper(voiceFirestore, 'voiceroom');
+
 }, 15000); 
 
 // ==============================================================
-// 📅 STALE QUEUE & VIP SWEEPERS
+// 📅 STALE QUEUE SWEEPER (DUAL DATABASE - Every 30 Min)
 // ==============================================================
 setInterval(async () => {
-  try {
-    const snapshot = await firestore.collection('randomQueue').get();
-    if (snapshot.empty) return;
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0); 
-    let cleaned = 0;
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
-      let docCreatedDate = data.createdAt?.toDate ? data.createdAt.toDate() : new Date(data.createdAt);
-      if (docCreatedDate && docCreatedDate < todayStart) {
-        await firestore.collection('randomQueue').doc(doc.id).delete();
-        cleaned++;
-      }
-    }
-    if (cleaned > 0) console.log(`[🧹 STALE QUEUE SWEEP] Cleaned ${cleaned} records.`);
-  } catch (error) {}
+  const queueSweeper = async (dbInstance, collectionName) => {
+      try {
+        const snapshot = await dbInstance.collection(collectionName).get();
+        if (snapshot.empty) return;
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0); 
+        let cleaned = 0;
+        
+        for (const doc of snapshot.docs) {
+          const data = doc.data();
+          let docCreatedDate = data.createdAt?.toDate ? data.createdAt.toDate() : new Date(data.createdAt);
+          if (docCreatedDate && docCreatedDate < todayStart) {
+            await dbInstance.collection(collectionName).doc(doc.id).delete();
+            cleaned++;
+          }
+        }
+        if (cleaned > 0) console.log(`[🧹 STALE QUEUE SWEEP] Cleaned ${cleaned} records from ${collectionName}.`);
+      } catch (error) {}
+  };
+
+  // 🚀 Sweep both Queues!
+  await queueSweeper(firestore, 'randomQueue');
+  await queueSweeper(voiceFirestore, 'voicerandomQueue');
+
 }, 30 * 60 * 1000);
 
+// ==============================================================
+// 💎 VIP SUBSCRIPTION SWEEPER
+// ==============================================================
 setInterval(async () => {
   try {
     const snap = await rtdb.ref('TotalSubscriptions').once('value');
@@ -310,6 +363,6 @@ setInterval(async () => {
   } catch (error) {}
 }, 60000); 
 
-app.get('/', (req, res) => res.send('MeetVibe Hybrid Server Running 🚀'));
+app.get('/', (req, res) => res.send('MeetVibe Master Hybrid Server Running 🚀'));
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`\n🚀 Server listening on port ${PORT}`));
