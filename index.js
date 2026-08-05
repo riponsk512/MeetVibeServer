@@ -46,7 +46,7 @@ firestore.collection('EndRoomRequest').onSnapshot(snapshot => {
       let title = data.action === 'next' ? "Stranger left" : "Call ended";
       let msg = data.action === 'next' ? "User is looking for someone else" : "The user has ended the call";
       
-      if (data.action === 'disconnected') {
+      if (data.action === 'disconnected' || data.action === 'background') {
         title = "Connection Lost ⚠️";
         msg = "User has lost the connection";
       }
@@ -134,12 +134,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 🚀 EXACT LOG YOU REQUESTED FOR JOINING
   socket.on('room_established', (data) => {
     console.log(`\n[🎉 CONNECTION ESTABLISHED] ${data.userA} and ${data.userB} have joined ${data.roomId} room\n`);
   });
 
-  // 🚀 HYBRID 2: SOCKET TRIGGERS
   socket.on('videoend', async ({ roomId }) => {
     console.log(`[🛑 SOCKET ACTION] 'videoend' triggered for room ${roomId}`);
     socket.to(roomId).emit('call_alert', { title: "Call ended", message: "The user has ended the call" });
@@ -154,7 +152,7 @@ io.on('connection', (socket) => {
 
   socket.on('videobackground', async ({ roomId }) => {
     console.log(`[📱 SOCKET ACTION] 'videobackground' triggered for room ${roomId}`);
-    socket.to(roomId).emit('call_alert', { title: "Call ended", message: "The user has ended the call" });
+    socket.to(roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
     await forceWipeRoom(roomId, 'Socket videobackground');
   });
 
@@ -196,7 +194,7 @@ io.on('connection', (socket) => {
 setInterval(async () => {
   const now = Date.now();
   for (const [socketId, user] of activeUsers.entries()) {
-    const timeoutThreshold = user.isWatchingAd ? 120000 : 20000; // 20 Seconds Buffer
+    const timeoutThreshold = user.isWatchingAd ? 120000 : 20000; 
     if (now - user.lastPing > timeoutThreshold) {
       console.log(`[🕒 PING DEAD] User ${user.email || user.uid} timed out. Missing pings for >20s.`);
       
@@ -231,8 +229,10 @@ async function handleUserDrop(socketId, reason) {
 }
 
 // ==============================================================
-// 📅 STALE QUEUE SWEEPER (30 MIN)
+// 📅 STALE QUEUE & GHOST ROOM SWEEPERS 
 // ==============================================================
+
+// 1. Queue Sweeper (30 MIN)
 setInterval(async () => {
   try {
     const snapshot = await firestore.collection('randomQueue').get();
@@ -248,13 +248,33 @@ setInterval(async () => {
         cleaned++;
       }
     }
-    if (cleaned > 0) console.log(`[🧹 STALE QUEUE SWEEP] Cleaned ${cleaned} records.`);
+    if (cleaned > 0) console.log(`[🧹 STALE QUEUE SWEEP] Cleaned ${cleaned} queue records.`);
   } catch (error) {}
 }, 30 * 60 * 1000);
 
-// ==============================================================
-// 💎 SUBSCRIPTION SWEEPER (1 MIN)
-// ==============================================================
+// 2. NEW: Ghost Room Sweeper (5 MIN) - Deletes orphaned rooms without connections
+setInterval(async () => {
+  try {
+    const snapshot = await firestore.collection('room').get();
+    if (snapshot.empty) return;
+    
+    const ghostLimit = Date.now() - (5 * 60 * 1000); // 5 minutes ago
+    let ghostCount = 0;
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      let docCreatedDate = data.createdAt?.toDate ? data.createdAt.toDate().getTime() : new Date(data.createdAt).getTime();
+      
+      if (docCreatedDate && docCreatedDate < ghostLimit) {
+        await forceWipeRoom(doc.id, 'Automated Ghost Room Sweeper');
+        ghostCount++;
+      }
+    }
+    if (ghostCount > 0) console.log(`[👻 GHOST SWEEP] Wiped ${ghostCount} stuck ghost rooms.`);
+  } catch (error) {}
+}, 5 * 60 * 1000);
+
+// 3. VIP Subscription Sweeper (1 MIN)
 setInterval(async () => {
   try {
     const snap = await rtdb.ref('TotalSubscriptions').once('value');
