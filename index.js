@@ -78,6 +78,8 @@ async function forceWipeRoom(roomId, triggerMethod) {
     calleeCands.forEach(doc => { deletePromises.push(doc.ref.delete()); calleeCount++; });
 
     await Promise.all(deletePromises);
+    
+    // Delete parent document (whether it officially exists or is an italic ghost)
     await roomRef.delete();
     
     console.log(`[✅ WIPE SUCCESSFUL] Completely eradicated Room ${roomId} from Firestore! (Cleaned ${callerCount} caller / ${calleeCount} callee signals)\n`);
@@ -120,12 +122,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 🚀 EXACT LOGGING FORMAT REQUESTED FOR BOTH USERS JOINING
   socket.on('room_established', (data) => {
     console.log(`\n[🎉 CONNECTION ESTABLISHED] ${data.userA} and ${data.userB} has joined room ${data.roomId}\n`);
   });
 
-  // 🚀 SOCKET TRIGGERS FOR FAST DROPS
   socket.on('videoend', async ({ roomId }) => {
     console.log(`[🛑 SOCKET ACTION] 'videoend' triggered for room ${roomId}`);
     socket.to(roomId).emit('call_alert', { title: "Call ended", message: "The user has ended the call" });
@@ -176,12 +176,11 @@ io.on('connection', (socket) => {
 });
 
 // ==============================================================
-// 🚀 SERVER PING CHECKER (Timeout raised to 60s to prevent false drops)
+// 🚀 SERVER PING CHECKER (Detects Dead/Killed Apps)
 // ==============================================================
 setInterval(async () => {
   const now = Date.now();
   for (const [socketId, user] of activeUsers.entries()) {
-    // 60 Seconds tolerance. We rely on NetInfo from the client for fast drops!
     const timeoutThreshold = user.isWatchingAd ? 120000 : 60000; 
     
     if (now - user.lastPing > timeoutThreshold) {
@@ -207,9 +206,7 @@ async function handleUserDrop(socketId, reason) {
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (error) {}
     
     if (user.email && user.inQueue) {
-      try { 
-        await firestore.collection('randomQueue').doc(user.email).delete(); 
-      } catch (error) {}
+      try { await firestore.collection('randomQueue').doc(user.email).delete(); } catch (error) {}
     }
     
     activeUsers.delete(socketId);
@@ -217,21 +214,33 @@ async function handleUserDrop(socketId, reason) {
 }
 
 // ==============================================================
-// 👻 ULTIMATE GHOST ROOM SWEEPER (Checks RTDB 'IsActive' Every 15s)
+// 👻 THE ULTIMATE GHOST ROOM SWEEPER (Every 15s)
 // ==============================================================
 setInterval(async () => {
   try {
-    const snapshot = await firestore.collection('room').get();
-    if (snapshot.empty) return;
-    
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
+    // 🚀 MAGIC FIX: listDocuments() finds the hidden "Italic" ghost documents that .get() misses
+    const docRefs = await firestore.collection('room').listDocuments();
+
+    for (const docRef of docRefs) {
+      const docSnap = await docRef.get();
+
+      // 👻 CASE 1: The document is an "Italic Ghost" (No data fields, but has subcollections)
+      if (!docSnap.exists) {
+         console.log(`\n[👻 ITALIC GHOST DETECTED] Found orphaned ghost room: ${docRef.id}`);
+         await forceWipeRoom(docRef.id, 'Italic Ghost Sweeper');
+         continue;
+      }
+
+      // CASE 2: The document exists, check if users are still genuinely active
+      const data = docSnap.data();
       const caller = data.caller;
       const callee = data.callee;
       
-      if (!caller || !callee) continue;
+      if (!caller || !callee) {
+          await forceWipeRoom(docRef.id, 'Malformed Room Sweeper');
+          continue;
+      }
 
-      // Check RTDB to see if user is actually active
       const isUserActive = async (email) => {
          const q = rtdb.ref('users').orderByChild('email').equalTo(email);
          const snap = await q.once('value');
@@ -244,14 +253,11 @@ setInterval(async () => {
       const callerActive = await isUserActive(caller);
       const calleeActive = await isUserActive(callee);
 
-      // 🚀 If EITHER user's database shows IsActive: false, WIPE THE ROOM INSTANTLY
+      // If EITHER user's RTDB shows IsActive: false, WIPE THE ROOM INSTANTLY
       if (!callerActive || !calleeActive) {
-         console.log(`\n[👻 INSTANT GHOST SWEEP] Room ${doc.id} contains an inactive user.`);
-         console.log(`- Caller (${caller}): Active=${callerActive}`);
-         console.log(`- Callee (${callee}): Active=${calleeActive}`);
-         
-         io.to(doc.id).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
-         await forceWipeRoom(doc.id, 'Ghost Sweeper (IsActive == false)');
+         console.log(`\n[👻 INACTIVE USER DETECTED] Room ${docRef.id} contains a disconnected user.`);
+         io.to(docRef.id).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
+         await forceWipeRoom(docRef.id, 'Ghost Sweeper (IsActive == false)');
       }
     }
   } catch (err) {}
@@ -285,6 +291,7 @@ setInterval(async () => {
     if (!snap.exists()) return;
     const subscriptions = snap.val();
     const now = new Date(); 
+    let expCount = 0;
     for (const [dateKey, subData] of Object.entries(subscriptions)) {
       const parts = dateKey.split('-');
       if (parts.length >= 7) {
@@ -295,9 +302,11 @@ setInterval(async () => {
             await rtdb.ref(`users/${subData.userId}`).update({ IsVip: false }); 
           }
           await rtdb.ref(`TotalSubscriptions/${dateKey}`).remove();
+          expCount++;
         }
       }
     }
+    if (expCount > 0) console.log(`[💎 VIP SWEEP] Expired ${expCount} subscriptions.`);
   } catch (error) {}
 }, 60000); 
 
