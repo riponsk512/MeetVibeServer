@@ -29,7 +29,6 @@ const voiceFirestoreApp = admin.initializeApp({
 }, 'voiceFirestoreApp');
 const voiceFirestore = voiceFirestoreApp.firestore();
 
-
 const app = express();
 app.use(cors());
 
@@ -48,14 +47,21 @@ firestore.collection('EndRoomRequest').onSnapshot(snapshot => {
   snapshot.docChanges().forEach(async change => {
     if (change.type === 'added') {
       const data = change.doc.data();
-      console.log(`\n[🔥 VIDEO HYBRID FALLBACK] Action: '${data.action}' by ${data.by} for Room: ${data.roomId}`);
+      console.log(`\n[🔥 VIDEO HYBRID FALLBACK] Action: '${data.action}' triggered by ${data.by} for Room: ${data.roomId}`);
+      
       await forceWipeRoom(data.roomId, `Video Firestore Request (${data.action})`);
       
-      io.to(data.roomId).emit('call_alert', { 
-        title: (data.action === 'disconnected' || data.action === 'background') ? "Connection Lost ⚠️" : (data.action === 'next' ? "Stranger left" : "Call ended"), 
-        message: (data.action === 'disconnected' || data.action === 'background') ? "User has lost the connection" : (data.action === 'next' ? "User is looking for someone else" : "The user has ended the call")
-      });
-      try { await change.doc.ref.delete(); } catch (err) {}
+      let title = data.action === 'next' ? "Stranger left" : "Call ended";
+      let msg = data.action === 'next' ? "User is looking for someone else" : "The user has ended the call";
+      
+      if (data.action === 'disconnected' || data.action === 'background') {
+        title = "Connection Lost ⚠️";
+        msg = "User has lost the connection";
+      }
+
+      io.to(data.roomId).emit('call_alert', { title: title, message: msg });
+      
+      try { await change.doc.ref.delete(); } catch (err) { }
     }
   });
 });
@@ -65,14 +71,21 @@ voiceFirestore.collection('EndRoomRequest').onSnapshot(snapshot => {
   snapshot.docChanges().forEach(async change => {
     if (change.type === 'added') {
       const data = change.doc.data();
-      console.log(`\n[🔥 VOICE HYBRID FALLBACK] Action: '${data.action}' by ${data.by} for Voice Room: ${data.roomId}`);
+      console.log(`\n[🔥 VOICE HYBRID FALLBACK] Action: '${data.action}' triggered by ${data.by} for Voice Room: ${data.roomId}`);
+      
       await forceWipeRoom(data.roomId, `Voice Firestore Request (${data.action})`);
       
-      io.to(data.roomId).emit('call_alert', { 
-        title: (data.action === 'disconnected' || data.action === 'background') ? "Connection Lost ⚠️" : (data.action === 'next' ? "Stranger left" : "Call ended"), 
-        message: (data.action === 'disconnected' || data.action === 'background') ? "User has lost the connection" : (data.action === 'next' ? "User is looking for someone else" : "The user has ended the call")
-      });
-      try { await change.doc.ref.delete(); } catch (err) {}
+      let title = data.action === 'next' ? "Stranger left" : "Call ended";
+      let msg = data.action === 'next' ? "User is looking for someone else" : "The user has ended the call";
+      
+      if (data.action === 'disconnected' || data.action === 'background') {
+        title = "Connection Lost ⚠️";
+        msg = "User has lost the connection";
+      }
+
+      io.to(data.roomId).emit('call_alert', { title: title, message: msg });
+      
+      try { await change.doc.ref.delete(); } catch (err) { }
     }
   });
 });
@@ -84,7 +97,7 @@ async function forceWipeRoom(roomId, triggerMethod) {
   if (!roomId) return;
   console.log(`\n[🛠️ DB WIPE INITIATED] Source: ${triggerMethod} | Target Room: ${roomId}`);
   
-  // Dynamic function that accepts the target database
+  // Dynamic function that targets a specific database and collection
   const wipeCollection = async (dbInstance, collectionName) => {
       try {
         const roomRef = dbInstance.collection(collectionName).doc(roomId);
@@ -98,15 +111,17 @@ async function forceWipeRoom(roomId, triggerMethod) {
         calleeCands.forEach(doc => { deletePromises.push(doc.ref.delete()); calleeCount++; });
 
         await Promise.all(deletePromises);
+        
+        // Delete parent document (whether it officially exists or is an italic ghost)
         await roomRef.delete();
         
         if (callerCount > 0 || calleeCount > 0) {
-            console.log(`[✅ WIPE SUCCESSFUL] Eradicated ${collectionName}/${roomId}!`);
+            console.log(`[✅ WIPE SUCCESSFUL] Completely eradicated ${collectionName}/${roomId}! (Cleaned ${callerCount} caller / ${calleeCount} callee signals)`);
         }
       } catch (error) {}
   };
 
-  // 🚀 SWEEP BOTH DBs SIMULTANEOUSLY! 
+  // 🚀 MAGIC: Run the wipe on BOTH databases simultaneously!
   await Promise.all([
       wipeCollection(firestore, 'room'),               // Video DB
       wipeCollection(voiceFirestore, 'voiceroom')      // Voice DB
@@ -116,13 +131,16 @@ async function forceWipeRoom(roomId, triggerMethod) {
 }
 
 // ==============================================================
-// 🚀 SOCKET.IO CONNECTIONS 
+// 🚀 SOCKET.IO CONNECTIONS & HYBRID LAYER 2
 // ==============================================================
 io.on('connection', (socket) => {
+  console.log(`[🔌 NEW SOCKET CONNECTED] ID: ${socket.id}`);
+
   socket.on('register_user', async (data) => {
     const { uid, email, screen } = data;
     if (!uid) return;
     activeUsers.set(socket.id, { uid, email, screen, lastPing: Date.now(), isWatchingAd: false, inQueue: false, roomId: null });
+    console.log(`[👤 USER ONLINE] Email: ${email} | Socket: ${socket.id} | Screen: ${screen}`);
     try { await rtdb.ref(`users/${uid}`).update({ IsActive: true }); } catch (error) {}
   });
 
@@ -131,6 +149,7 @@ io.on('connection', (socket) => {
       const user = activeUsers.get(socket.id);
       user.inQueue = data.inQueue;
       if (data.email) user.email = data.email;
+      console.log(`[🎯 QUEUE UPDATE] ${user.email} is ${data.inQueue ? 'SEARCHING' : 'IDLE'}`);
     }
   });
 
@@ -139,7 +158,9 @@ io.on('connection', (socket) => {
       const user = activeUsers.get(socket.id);
       if (user.roomId) socket.leave(user.roomId); 
       user.roomId = data.roomId;
-      if (data.roomId) socket.join(data.roomId); 
+      if (data.roomId) {
+        socket.join(data.roomId); 
+      }
     }
   });
 
@@ -148,41 +169,56 @@ io.on('connection', (socket) => {
   });
 
   socket.on('videoend', async ({ roomId }) => {
+    console.log(`[🛑 SOCKET ACTION] 'videoend' triggered for room ${roomId}`);
     socket.to(roomId).emit('call_alert', { title: "Call ended", message: "The user has ended the call" });
     await forceWipeRoom(roomId, 'Socket videoend');
   });
 
   socket.on('videonext', async ({ roomId }) => {
+    console.log(`[⏭️ SOCKET ACTION] 'videonext' triggered for room ${roomId}`);
     socket.to(roomId).emit('call_alert', { title: "Stranger left", message: "User is looking for someone else" });
     await forceWipeRoom(roomId, 'Socket videonext');
   });
 
   socket.on('videobackground', async ({ roomId }) => {
+    console.log(`[📱 SOCKET ACTION] 'videobackground' triggered for room ${roomId}`);
     socket.to(roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
     await forceWipeRoom(roomId, 'Socket videobackground');
   });
 
   socket.on('checkInternet', async ({ roomId }) => {
+    console.log(`[📶 SOCKET ACTION] 'checkInternet' triggered for room ${roomId}`);
     socket.to(roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
     await forceWipeRoom(roomId, 'Socket checkInternet');
   });
 
   socket.on('ping', () => {
-    if (activeUsers.has(socket.id)) activeUsers.get(socket.id).lastPing = Date.now();
+    if (activeUsers.has(socket.id)) {
+      activeUsers.get(socket.id).lastPing = Date.now();
+    }
+  });
+
+  socket.on('ad_status', (data) => {
+    if (activeUsers.has(socket.id)) {
+      const user = activeUsers.get(socket.id);
+      user.isWatchingAd = data.isWatchingAd;
+      user.lastPing = Date.now();
+    }
   });
 
   socket.on('manual_disconnect', async () => {
+    console.log(`[⚠️ MANUAL DISCONNECT] Socket ${socket.id} (App killed/backgrounded)`);
     await handleUserDrop(socket.id, "App Backgrounded/Closed");
   });
 
-  // 🚀 FIXED TYPO HERE (socket.id instead of socketId)
   socket.on('disconnect', async () => {
+    console.log(`[🔌 SOCKET LOST] ID: ${socket.id}`);
     await handleUserDrop(socket.id, "Socket Disconnected");
   });
 });
 
 // ==============================================================
-// 🚀 SERVER PING CHECKER 
+// 🚀 SERVER PING CHECKER (Detects Dead/Killed Apps)
 // ==============================================================
 setInterval(async () => {
   const now = Date.now();
@@ -190,10 +226,14 @@ setInterval(async () => {
     const timeoutThreshold = user.isWatchingAd ? 120000 : 60000; 
     
     if (now - user.lastPing > timeoutThreshold) {
+      console.log(`[🕒 PING DEAD] User ${user.email || user.uid} timed out. Missing pings for >60s.`);
+      
       if (user.roomId) {
+        console.log(`[🚨 ALERTING PARTNER] Broadcasting disconnect to Room ${user.roomId}`);
         io.to(user.roomId).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
         await forceWipeRoom(user.roomId, 'Server Ping Timeout');
       }
+
       await handleUserDrop(socketId, "Server Ping Timeout");
       io.to(socketId).emit('force_disconnect');
     }
@@ -203,34 +243,42 @@ setInterval(async () => {
 async function handleUserDrop(socketId, reason) {
   if (activeUsers.has(socketId)) {
     const user = activeUsers.get(socketId);
+    console.log(`[🧹 CLEANING USER DATA] Dropping ${user.email || socketId} | Reason: ${reason}`);
+    
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (error) {}
     
     // 🚀 DUAL-DATABASE QUEUE CLEANUP
     if (user.email && user.inQueue) {
-      try { 
-        await firestore.collection('randomQueue').doc(user.email).delete(); 
-        await voiceFirestore.collection('voicerandomQueue').doc(user.email).delete(); 
-      } catch (error) {}
+      try { await firestore.collection('randomQueue').doc(user.email).delete(); } catch (error) {}
+      try { await voiceFirestore.collection('voicerandomQueue').doc(user.email).delete(); } catch (error) {}
     }
+    
     activeUsers.delete(socketId);
   }
 }
 
 // ==============================================================
-// 👻 GHOST ROOM SWEEPER (DUAL DATABASE - Every 15s)
+// 👻 THE ULTIMATE GHOST ROOM SWEEPER (DUAL DATABASE - Every 15s)
 // ==============================================================
 setInterval(async () => {
   const ghostSweeper = async (dbInstance, collectionName) => {
       try {
         const docRefs = await dbInstance.collection(collectionName).listDocuments();
+
         for (const docRef of docRefs) {
           const docSnap = await docRef.get();
+
           if (!docSnap.exists) {
+             console.log(`\n[👻 ITALIC GHOST DETECTED] Found orphaned ghost ${collectionName}: ${docRef.id}`);
              await forceWipeRoom(docRef.id, 'Italic Ghost Sweeper');
              continue;
           }
+
           const data = docSnap.data();
-          if (!data.caller || !data.callee) {
+          const caller = data.caller;
+          const callee = data.callee;
+          
+          if (!caller || !callee) {
               await forceWipeRoom(docRef.id, 'Malformed Room Sweeper');
               continue;
           }
@@ -244,10 +292,11 @@ setInterval(async () => {
              return val[uid].IsActive === true;
           };
 
-          const callerActive = await isUserActive(data.caller);
-          const calleeActive = await isUserActive(data.callee);
+          const callerActive = await isUserActive(caller);
+          const calleeActive = await isUserActive(callee);
 
           if (!callerActive || !calleeActive) {
+             console.log(`\n[👻 INACTIVE USER DETECTED] ${collectionName} ${docRef.id} contains a disconnected user.`);
              io.to(docRef.id).emit('call_alert', { title: "Connection Lost ⚠️", message: "User has lost the connection" });
              await forceWipeRoom(docRef.id, 'Ghost Sweeper (IsActive == false)');
           }
@@ -255,8 +304,10 @@ setInterval(async () => {
       } catch (err) {}
   };
 
+  // Sweep both Video and Voice rooms!
   await ghostSweeper(firestore, 'room');
   await ghostSweeper(voiceFirestore, 'voiceroom');
+
 }, 15000); 
 
 // ==============================================================
@@ -269,19 +320,24 @@ setInterval(async () => {
         if (snapshot.empty) return;
         const todayStart = new Date();
         todayStart.setHours(0, 0, 0, 0); 
+        let cleaned = 0;
         
         for (const doc of snapshot.docs) {
           const data = doc.data();
           let docCreatedDate = data.createdAt?.toDate ? data.createdAt.toDate() : new Date(data.createdAt);
           if (docCreatedDate && docCreatedDate < todayStart) {
             await dbInstance.collection(collectionName).doc(doc.id).delete();
+            cleaned++;
           }
         }
+        if (cleaned > 0) console.log(`[🧹 STALE QUEUE SWEEP] Cleaned ${cleaned} records from ${collectionName}.`);
       } catch (error) {}
   };
 
+  // Sweep both Video and Voice Queues!
   await queueSweeper(firestore, 'randomQueue');
   await queueSweeper(voiceFirestore, 'voicerandomQueue');
+
 }, 30 * 60 * 1000);
 
 // ==============================================================
@@ -293,6 +349,7 @@ setInterval(async () => {
     if (!snap.exists()) return;
     const subscriptions = snap.val();
     const now = new Date(); 
+    let expCount = 0;
     for (const [dateKey, subData] of Object.entries(subscriptions)) {
       const parts = dateKey.split('-');
       if (parts.length >= 7) {
@@ -303,12 +360,14 @@ setInterval(async () => {
             await rtdb.ref(`users/${subData.userId}`).update({ IsVip: false }); 
           }
           await rtdb.ref(`TotalSubscriptions/${dateKey}`).remove();
+          expCount++;
         }
       }
     }
+    if (expCount > 0) console.log(`[💎 VIP SWEEP] Expired ${expCount} subscriptions.`);
   } catch (error) {}
 }, 60000); 
 
-app.get('/', (req, res) => res.send('MeetVibe Master Dual-DB Server Running 🚀'));
+app.get('/', (req, res) => res.send('MeetVibe Master Dual-DB Hybrid Server Running 🚀'));
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`\n🚀 Server listening on port ${PORT}`));
