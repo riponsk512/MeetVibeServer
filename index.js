@@ -4,11 +4,12 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const admin = require('firebase-admin');
 
+// ==========================================
+// 🔑 DUAL FIREBASE ADMIN INITIALIZATION
+// ==========================================
 console.log("[⚙️ SYSTEM] Initializing Firebase Admin SDKs...");
 
-// ==========================================
-// 🔑 1. REALTIME DATABASE (Presence & Users)
-// ==========================================
+// 1. Realtime Database (Presence & Subscriptions)
 const rtdbServiceAccount = require('./serviceAccountKey.json');
 const rtdbApp = admin.initializeApp({
    credential: admin.credential.cert(rtdbServiceAccount),
@@ -21,19 +22,20 @@ const firestoreApp = admin.initializeApp({
 }, 'firestoreApp');
 const firestore = firestoreApp.firestore();
 
-// ==========================================
-// 🔑 3. VOICE FIRESTORE (Voice Rooms - thirdDb)
-// ==========================================
+// 3. Voice Firestore (Voice Rooms & Queues - thirdDb)
 const voiceFirestoreServiceAccount = require('./voiceCallfirestoreServiceAccountKey.json');
 const voiceFirestoreApp = admin.initializeApp({
   credential: admin.credential.cert(voiceFirestoreServiceAccount)
 }, 'voiceFirestoreApp');
 const voiceFirestore = voiceFirestoreApp.firestore();
 
+
 const app = express();
 app.use(cors());
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+
 const activeUsers = new Map();
 
 // ==============================================================
@@ -173,8 +175,9 @@ io.on('connection', (socket) => {
     await handleUserDrop(socket.id, "App Backgrounded/Closed");
   });
 
+  // 🚀 FIXED TYPO HERE (socket.id instead of socketId)
   socket.on('disconnect', async () => {
-    await handleUserDrop(socketId, "Socket Disconnected");
+    await handleUserDrop(socket.id, "Socket Disconnected");
   });
 });
 
