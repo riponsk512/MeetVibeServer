@@ -383,9 +383,9 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 
 // ==========================================
-// 🔑 TRIPLE FIREBASE ADMIN INITIALIZATION
+// 🔑 QUAD FIREBASE ADMIN INITIALIZATION
 // ==========================================
-console.log("[⚙️ SYSTEM] Initializing Firebase Admin SDKs...");
+console.log("[⚙️ SYSTEM] Initializing Quad Firebase Admin SDKs (RTDB, Video, Voice, Chat)...");
 
 // 1. Realtime Database (Presence & Subscriptions)
 const rtdbServiceAccount = require('./serviceAccountKey.json');
@@ -400,13 +400,19 @@ const firestoreApp = admin.initializeApp({
 }, 'firestoreApp');
 const firestore = firestoreApp.firestore();
 
-
 // 3. Voice Firestore (thirdDb: voiceroom & voicerandomQueue)
 const voiceFirestoreServiceAccount = require('./voiceCallfirestoreServiceAccountKey.json');
 const voiceFirestoreApp = admin.initializeApp({
   credential: admin.credential.cert(voiceFirestoreServiceAccount)
 }, 'voiceFirestoreApp');
 const voiceFirestore = voiceFirestoreApp.firestore();
+
+// 4. Chat Firestore (fourthDb: chatroom & randomChatQueue)
+const chatFirestoreServiceAccount = require('./chatFirestoreServiceAccountKey.json'); // ⚠️ ENSURE KEY FILE MATCHES THIS NAME
+const chatFirestoreApp = admin.initializeApp({
+  credential: admin.credential.cert(chatFirestoreServiceAccount)
+}, 'chatFirestoreApp');
+const chatFirestore = chatFirestoreApp.firestore();
 
 const app = express();
 app.use(cors());
@@ -417,7 +423,9 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const activeUsers = new Map();
 const wipingRooms = new Set();
 const pendingRoomDrops = new Map(); // roomId -> timeoutId
-const protectedRoomsUntil = new Map(); // roomId -> timestampMs (Protects room while either user picks image from gallery)
+const protectedRoomsUntil = new Map(); // roomId -> timestampMs (Protects room while user picks image from gallery)
+
+const TERMINAL_STATUSES = ['ended', 'next', 'background', 'disconnected'];
 
 // ==============================================================
 // 🚀 HELPERS: ALERTS & PRESENCE CHECK
@@ -430,6 +438,15 @@ function getAlertPayload(action) {
     return { title: "Connection Lost ⚠️", message: "User has lost the connection" };
   }
   return { title: "Call ended", message: "The user has ended the call" };
+}
+
+function isTerminalRoomState(data) {
+  if (!data) return false;
+  if (data.endedBy) return true;
+  if (data.status && TERMINAL_STATUSES.includes(String(data.status).toLowerCase())) {
+    return true;
+  }
+  return false;
 }
 
 function isRoomProtectedForGallery(roomId) {
@@ -473,27 +490,34 @@ async function removeUserFromAllQueues(email) {
   if (!email) return;
   await Promise.all([
     firestore.collection('randomQueue').doc(email).delete().catch(() => {}),
-    voiceFirestore.collection('voicerandomQueue').doc(email).delete().catch(() => {})
+    voiceFirestore.collection('voicerandomQueue').doc(email).delete().catch(() => {}),
+    chatFirestore.collection('randomChatQueue').doc(email).delete().catch(() => {})
   ]);
 }
 
 // ==============================================================
-// 🚀 CORE FUNCTION: CROSS-DATABASE AGGRESSIVE WIPE (WITH 2ND PASS)
+// 🚀 CORE FUNCTION: CROSS-DATABASE AGGRESSIVE WIPE (VIDEO, VOICE & CHAT)
 // ==============================================================
-async function wipeSingleCollection(dbInstance, collectionName, roomId) {
+async function wipeSingleCollection(
+  dbInstance,
+  collectionName,
+  roomId,
+  callerSubName = 'callerCandidates',
+  calleeSubName = 'calleeCandidates'
+) {
   try {
     const roomRef = dbInstance.collection(collectionName).doc(roomId);
     const deletePromises = [];
     let callerCount = 0;
     let calleeCount = 0;
 
-    const callerCands = await roomRef.collection('callerCandidates').get();
+    const callerCands = await roomRef.collection(callerSubName).get();
     callerCands.forEach(doc => {
       deletePromises.push(doc.ref.delete());
       callerCount++;
     });
 
-    const calleeCands = await roomRef.collection('calleeCandidates').get();
+    const calleeCands = await roomRef.collection(calleeSubName).get();
     calleeCands.forEach(doc => {
       deletePromises.push(doc.ref.delete());
       calleeCount++;
@@ -521,22 +545,27 @@ async function forceWipeRoom(roomId, triggerMethod) {
   console.log(`\n[🛠️ DB WIPE INITIATED] Source: ${triggerMethod} | Target Room: ${roomId}`);
 
   try {
-    const [videoRes, voiceRes] = await Promise.all([
-      wipeSingleCollection(firestore, 'room', roomId),
-      wipeSingleCollection(voiceFirestore, 'voiceroom', roomId)
+    // Pass 1: Immediate wipe across Video ('room'), Voice ('voiceroom'), and Chat ('chatroom')
+    const [videoRes, voiceRes, chatRes] = await Promise.all([
+      wipeSingleCollection(firestore, 'room', roomId, 'callerCandidates', 'calleeCandidates'),
+      wipeSingleCollection(voiceFirestore, 'voiceroom', roomId, 'callerCandidates', 'calleeCandidates'),
+      wipeSingleCollection(chatFirestore, 'chatroom', roomId, 'chatCallerCandidates', 'chatCalleeCandidates')
     ]);
 
     console.log(
       `[✅ WIPE PASS 1 COMPLETE] Room: ${roomId} | ` +
-      `Video(Caller:${videoRes.callerCount}, Callee:${videoRes.calleeCount}) | ` +
-      `Voice(Caller:${voiceRes.callerCount}, Callee:${voiceRes.calleeCount})`
+      `Video(${videoRes.callerCount}/${videoRes.calleeCount}) | ` +
+      `Voice(${voiceRes.callerCount}/${voiceRes.calleeCount}) | ` +
+      `Chat(${chatRes.callerCount}/${chatRes.calleeCount})`
     );
 
+    // Pass 2: Catch any late in-flight ICE candidates 2.5s later so italic ghost docs never remain
     setTimeout(async () => {
       try {
         await Promise.all([
-          wipeSingleCollection(firestore, 'room', roomId),
-          wipeSingleCollection(voiceFirestore, 'voiceroom', roomId)
+          wipeSingleCollection(firestore, 'room', roomId, 'callerCandidates', 'calleeCandidates'),
+          wipeSingleCollection(voiceFirestore, 'voiceroom', roomId, 'callerCandidates', 'calleeCandidates'),
+          wipeSingleCollection(chatFirestore, 'chatroom', roomId, 'chatCallerCandidates', 'chatCalleeCandidates')
         ]);
       } catch (e) {} finally {
         wipingRooms.delete(roomId);
@@ -550,9 +579,9 @@ async function forceWipeRoom(roomId, triggerMethod) {
 }
 
 // ==============================================================
-// 🚀 HYBRID LAYER A: LIVE ROOM STATUS WATCHERS (VIDEO & VOICE)
+// 🚀 HYBRID LAYER A: LIVE ROOM STATUS WATCHERS (VIDEO, VOICE & CHAT)
 // ==============================================================
-console.log("[🔥 SYSTEM] Starting Live Room Status Watchers for 'room' (Video) & 'voiceroom' (Voice)...");
+console.log("[🔥 SYSTEM] Starting Live Room Status Watchers for 'room', 'voiceroom', & 'chatroom'...");
 
 function attachRoomStatusWatcher(dbInstance, collectionName, label) {
   dbInstance.collection(collectionName).onSnapshot(snapshot => {
@@ -561,15 +590,15 @@ function attachRoomStatusWatcher(dbInstance, collectionName, label) {
       const data = change.doc.data() || {};
 
       if (change.type === 'added') {
-        // ⚠️ IMPORTANT: Do NOT delete voicerandomQueue/randomQueue here!
-        // Callee needs to read their queue doc's roomId first; each client deletes its own queue doc on join.
         console.log(`[📞 ${label} ROOM CREATED] ID: ${roomId} | Caller: ${data.caller || 'N/A'} | Callee: ${data.callee || 'N/A'}`);
       }
 
-      if ((change.type === 'added' || change.type === 'modified') && (data.status || data.endedBy)) {
-        const action = data.status || 'ended';
+      // Only wipe when status is a TERMINAL state ('ended', 'next', 'background', 'disconnected') — ignores 'active'
+      if ((change.type === 'added' || change.type === 'modified') && isTerminalRoomState(data)) {
+        const action = (data.status && TERMINAL_STATUSES.includes(String(data.status).toLowerCase()))
+          ? String(data.status).toLowerCase()
+          : 'ended';
 
-        // Ignore false 'background' status if room is currently protected by gallery image picker
         if (action === 'background' && isRoomProtectedForGallery(roomId)) {
           console.log(`[🛡️ GALLERY GUARD] Ignored Firestore background status for protected room ${roomId}`);
           return;
@@ -590,11 +619,12 @@ function attachRoomStatusWatcher(dbInstance, collectionName, label) {
 
 attachRoomStatusWatcher(firestore, 'room', 'VIDEO');
 attachRoomStatusWatcher(voiceFirestore, 'voiceroom', 'VOICE');
+attachRoomStatusWatcher(chatFirestore, 'chatroom', 'CHAT');
 
 // ==============================================================
-// 🚀 HYBRID LAYER B: END-ROOM-REQUEST WATCHERS (VIDEO & VOICE)
+// 🚀 HYBRID LAYER B: END-ROOM-REQUEST WATCHERS (VIDEO, VOICE & CHAT)
 // ==============================================================
-console.log("[🔥 SYSTEM] Starting Firestore 'EndRoomRequest' Watchers for Video & Voice...");
+console.log("[🔥 SYSTEM] Starting Firestore 'EndRoomRequest' Watchers for Video, Voice & Chat...");
 
 function attachEndRequestWatcher(dbInstance, label) {
   dbInstance.collection('EndRoomRequest').onSnapshot(snapshot => {
@@ -624,6 +654,7 @@ function attachEndRequestWatcher(dbInstance, label) {
 
 attachEndRequestWatcher(firestore, 'VIDEO');
 attachEndRequestWatcher(voiceFirestore, 'VOICE');
+attachEndRequestWatcher(chatFirestore, 'CHAT');
 
 // ==============================================================
 // 🚀 SOCKET.IO CONNECTIONS & HYBRID LAYER C
@@ -673,7 +704,7 @@ io.on('connection', (socket) => {
           console.log(`[🛡️ DROP CANCELLED] User ${user.email} active in Room: ${data.roomId}`);
         }
 
-        // Now that the client has entered InCallScreen and joined the socket room, safe to clean their queue doc
+        // Clean user's queue docs across all 3 databases once they enter the room
         if (user.email) {
           await removeUserFromAllQueues(user.email);
         }
@@ -729,7 +760,6 @@ io.on('connection', (socket) => {
 
       const targetRoomId = data?.roomId || user.roomId;
       if (targetRoomId && user.isWatchingAd) {
-        // Protect this room for 25 seconds while user picks an image from the gallery
         protectedRoomsUntil.set(targetRoomId, Date.now() + 25000);
       }
 
@@ -807,7 +837,6 @@ async function handleUserDrop(socketId, reason) {
   if (user.roomId) {
     const roomId = user.roomId;
     if (!pendingRoomDrops.has(roomId)) {
-      // Wait 6s for transient socket reconnects before wiping an active call
       const waitMs = reason === "App Backgrounded/Closed" ? 2500 : 8000;
       const timer = setTimeout(async () => {
         pendingRoomDrops.delete(roomId);
@@ -826,7 +855,7 @@ async function handleUserDrop(socketId, reason) {
 }
 
 // ==============================================================
-// ⚡ 10-SECOND QUEUE SWEEPER (USING FIRESTORE SERVER TIMESTAMPS)
+// ⚡ 10-SECOND QUEUE SWEEPER (VIDEO, VOICE & CHAT QUEUES)
 // ==============================================================
 setInterval(async () => {
   const sweepQueueCollection = async (dbInstance, collectionName, label) => {
@@ -841,7 +870,6 @@ setInterval(async () => {
         const data = docSnap.data() || {};
         const email = docSnap.id;
 
-        // Use Firestore server timestamp so device clock drift never deletes active users
         const createdMs = data.createdAt?.toDate ? data.createdAt.toDate().getTime() : 0;
         const ageMs = createdMs ? now - createdMs : 0;
 
@@ -852,7 +880,7 @@ setInterval(async () => {
           continue;
         }
 
-        // 2. If queue entry is >6s old and user is not connected on socket or active in RTDB, purge it
+        // 2. If queue entry is >6s old and user is offline in both Socket and RTDB, purge it
         if (createdMs && ageMs > 6000) {
           const active = await isUserActiveInRTDB(email, data.uid);
           if (!active) {
@@ -870,12 +898,13 @@ setInterval(async () => {
 
   await Promise.all([
     sweepQueueCollection(firestore, 'randomQueue', 'VIDEO'),
-    sweepQueueCollection(voiceFirestore, 'voicerandomQueue', 'VOICE')
+    sweepQueueCollection(voiceFirestore, 'voicerandomQueue', 'VOICE'),
+    sweepQueueCollection(chatFirestore, 'randomChatQueue', 'CHAT')
   ]);
 }, 10000);
 
 // ==============================================================
-// 👻 ULTIMATE GHOST ROOM SWEEPER (DUAL DATABASE - Every 15s)
+// 👻 ULTIMATE GHOST ROOM SWEEPER (VIDEO, VOICE & CHAT - Every 15s)
 // ==============================================================
 setInterval(async () => {
   const sweepDatabaseRooms = async (dbInstance, collectionName, label) => {
@@ -896,15 +925,17 @@ setInterval(async () => {
 
         // CASE 1: Italic Ghost Document (Parent deleted, subcollections remain)
         if (!docSnap.exists) {
+          console.log(`\n[👻 ITALIC GHOST DETECTED] ${label} (${collectionName}/${roomId})`);
           await forceWipeRoom(roomId, `${label} Italic Ghost Sweeper`);
           continue;
         }
 
         const data = docSnap.data() || {};
 
-        // CASE 2: Document already has a terminal status
-        if (data.status || data.endedBy) {
-          io.to(roomId).emit('call_alert', getAlertPayload(data.status));
+        // CASE 2: Document has a terminal status ('ended', 'next', 'background', 'disconnected')
+        if (isTerminalRoomState(data)) {
+          const action = data.status || 'ended';
+          io.to(roomId).emit('call_alert', getAlertPayload(action));
           await forceWipeRoom(roomId, `${label} Lingering Status Sweeper`);
           continue;
         }
@@ -921,8 +952,10 @@ setInterval(async () => {
         // Give newly created rooms a 30s grace period to complete transition & WebRTC handshake
         if (roomAgeMs < 30000) continue;
 
-        // CASE 4: Room older than 35s that never completed offer/answer handshake
-        if (roomAgeMs > 35000 && (!data.offer || !data.answer)) {
+        // CASE 4: Room older than 35s that never completed offer/answer OR chatOffer/chatAnswer handshake
+        const hasHandshake = (data.offer && data.answer) || (data.chatOffer && data.chatAnswer);
+        if (roomAgeMs > 35000 && !hasHandshake) {
+          console.log(`\n[👻 UNFINISHED HANDSHAKE] ${label} ${roomId} stuck without offer/answer for >35s.`);
           io.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
           await forceWipeRoom(roomId, `${label} Unfinished Handshake Sweeper`);
           continue;
@@ -945,7 +978,8 @@ setInterval(async () => {
 
   await Promise.all([
     sweepDatabaseRooms(firestore, 'room', 'VIDEO'),
-    sweepDatabaseRooms(voiceFirestore, 'voiceroom', 'VOICE')
+    sweepDatabaseRooms(voiceFirestore, 'voiceroom', 'VOICE'),
+    sweepDatabaseRooms(chatFirestore, 'chatroom', 'CHAT')
   ]);
 }, 15000);
 
@@ -978,6 +1012,6 @@ setInterval(async () => {
   } catch (error) {}
 }, 60000);
 
-app.get('/', (req, res) => res.send('MeetVibe Master Dual-DB Hybrid Server Running 🚀'));
+app.get('/', (req, res) => res.send('MeetVibe Master Quad-DB Hybrid Server Running 🚀'));
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`\n🚀 Server listening on port ${PORT}`));
