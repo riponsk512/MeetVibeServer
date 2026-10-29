@@ -375,667 +375,6 @@
 
 
 
-// const express = require('express');
-// const http = require('http');
-// const { Server } = require('socket.io');
-// const cors = require('cors');
-// const admin = require('firebase-admin');
-
-// // ==========================================
-// // 🔑 QUAD FIREBASE ADMIN INITIALIZATION
-// // ==========================================
-// console.log("[⚙️ SYSTEM] Initializing Quad Firebase Admin SDKs (RTDB, Video, Voice, Chat)...");
-
-// // 1. Realtime Database (Presence & Subscriptions)
-// const rtdbServiceAccount = require('./serviceAccountKey.json');
-// const rtdbApp = admin.initializeApp({
-//    credential: admin.credential.cert(rtdbServiceAccount),
-//   databaseURL: "https://testvibe-cc69f-default-rtdb.firebaseio.com" // ⚠️ REPLACE WITH YOUR RTDB URL
-// }, 'rtdbApp');
-// const rtdb = rtdbApp.database();
-// const firestoreServiceAccount = require('./videoChatfirestoreServiceAccountKey.json');
-// const firestoreApp = admin.initializeApp({
-//   credential: admin.credential.cert(firestoreServiceAccount)
-// }, 'firestoreApp');
-// const firestore = firestoreApp.firestore();
-
-
-// // 3. Voice Firestore (thirdDb: voiceroom & voicerandomQueue)
-// const voiceFirestoreServiceAccount = require('./voiceCallfirestoreServiceAccountKey.json');
-// const voiceFirestoreApp = admin.initializeApp({
-//   credential: admin.credential.cert(voiceFirestoreServiceAccount)
-// }, 'voiceFirestoreApp');
-// const voiceFirestore = voiceFirestoreApp.firestore();
-
-// // 4. Chat Firestore (fourthDb: chatroom & randomChatQueue)
-// const chatFirestoreServiceAccount = require('./chatFirestoreServiceAccountKey.json');
-// const chatFirestoreApp = admin.initializeApp({
-//   credential: admin.credential.cert(chatFirestoreServiceAccount)
-// }, 'chatFirestoreApp');
-// const chatFirestore = chatFirestoreApp.firestore();
-
-// const app = express();
-// app.use(cors());
-
-// const server = http.createServer(app);
-// const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
-
-// const activeUsers = new Map();
-// const wipingRooms = new Set();
-// const pendingRoomDrops = new Map(); // roomId -> timeoutId
-// const protectedRoomsUntil = new Map(); // roomId -> timestampMs
-
-// const TERMINAL_STATUSES = ['ended', 'next', 'background', 'disconnected'];
-
-// // ==============================================================
-// // 🚀 HELPERS: ALERTS & PRESENCE CHECK
-// // ==============================================================
-// function getAlertPayload(action) {
-//   if (action === 'next') {
-//     return { title: "Stranger left", message: "User is looking for someone else" };
-//   }
-//   if (action === 'disconnected' || action === 'background') {
-//     return { title: "Connection Lost ⚠️", message: "User has lost the connection" };
-//   }
-//   return { title: "Call ended", message: "The user has ended the call" };
-// }
-
-// function isTerminalRoomState(data) {
-//   if (!data) return false;
-//   if (data.endedBy) return true;
-//   if (data.status && TERMINAL_STATUSES.includes(String(data.status).toLowerCase())) {
-//     return true;
-//   }
-//   return false;
-// }
-
-// function isRoomProtectedForGallery(roomId) {
-//   if (!roomId) return false;
-//   const until = protectedRoomsUntil.get(roomId);
-//   if (until && Date.now() < until) return true;
-//   for (const u of activeUsers.values()) {
-//     if (u.roomId === roomId && u.isWatchingAd) return true;
-//   }
-//   return false;
-// }
-
-// function isUserConnectedOnAnySocket(email, uid = null) {
-//   const targetEmail = email ? String(email).toLowerCase() : null;
-//   for (const u of activeUsers.values()) {
-//     if (uid && u.uid === uid) return true;
-//     if (targetEmail && u.email && String(u.email).toLowerCase() === targetEmail) return true;
-//   }
-//   return false;
-// }
-
-// function isRoomOccupiedOnSocket(roomId) {
-//   if (!roomId) return false;
-//   const roomSockets = io.sockets.adapter.rooms.get(roomId);
-//   if (roomSockets && roomSockets.size > 0) return true;
-//   for (const u of activeUsers.values()) {
-//     if (u.roomId === roomId) return true;
-//   }
-//   return false;
-// }
-
-// async function isUserActiveInRTDB(email, uid = null) {
-//   try {
-//     if (isUserConnectedOnAnySocket(email, uid)) return true;
-//     if (uid) {
-//       const snap = await rtdb.ref(`users/${uid}/IsActive`).once('value');
-//       if (snap.exists()) return snap.val() !== false;
-//     }
-//     if (!email) return true;
-//     const snap = await rtdb.ref('users').orderByChild('email').equalTo(email).once('value');
-//     // ⚠️ Never return false if query returns empty (email casing or missing index)
-//     if (!snap.exists()) return true;
-//     const val = snap.val();
-//     const firstUid = Object.keys(val)[0];
-//     return val[firstUid]?.IsActive !== false;
-//   } catch (e) {
-//     return true;
-//   }
-// }
-
-// async function removeUserFromAllQueues(email) {
-//   if (!email) return;
-//   await Promise.all([
-//     firestore.collection('randomQueue').doc(email).delete().catch(() => {}),
-//     voiceFirestore.collection('voicerandomQueue').doc(email).delete().catch(() => {}),
-//     chatFirestore.collection('randomChatQueue').doc(email).delete().catch(() => {})
-//   ]);
-// }
-
-// // ==============================================================
-// // 🚀 CORE FUNCTION: CROSS-DATABASE AGGRESSIVE WIPE
-// // ==============================================================
-// async function wipeSingleCollection(
-//   dbInstance,
-//   collectionName,
-//   roomId,
-//   callerSubName = 'callerCandidates',
-//   calleeSubName = 'calleeCandidates'
-// ) {
-//   try {
-//     const roomRef = dbInstance.collection(collectionName).doc(roomId);
-//     const deletePromises = [];
-//     let callerCount = 0;
-//     let calleeCount = 0;
-
-//     const callerCands = await roomRef.collection(callerSubName).get();
-//     callerCands.forEach(doc => {
-//       deletePromises.push(doc.ref.delete());
-//       callerCount++;
-//     });
-
-//     const calleeCands = await roomRef.collection(calleeSubName).get();
-//     calleeCands.forEach(doc => {
-//       deletePromises.push(doc.ref.delete());
-//       calleeCount++;
-//     });
-
-//     await Promise.all(deletePromises);
-//     await roomRef.delete();
-
-//     return { callerCount, calleeCount };
-//   } catch (error) {
-//     return { callerCount: 0, calleeCount: 0 };
-//   }
-// }
-
-// async function forceWipeRoom(roomId, triggerMethod) {
-//   if (!roomId || wipingRooms.has(roomId)) return;
-//   wipingRooms.add(roomId);
-
-//   if (pendingRoomDrops.has(roomId)) {
-//     clearTimeout(pendingRoomDrops.get(roomId));
-//     pendingRoomDrops.delete(roomId);
-//   }
-//   protectedRoomsUntil.delete(roomId);
-
-//   console.log(`\n[🛠️ DB WIPE INITIATED] Source: ${triggerMethod} | Target Room: ${roomId}`);
-
-//   try {
-//     const [videoRes, voiceRes, chatRes] = await Promise.all([
-//       wipeSingleCollection(firestore, 'room', roomId, 'callerCandidates', 'calleeCandidates'),
-//       wipeSingleCollection(voiceFirestore, 'voiceroom', roomId, 'callerCandidates', 'calleeCandidates'),
-//       wipeSingleCollection(chatFirestore, 'chatroom', roomId, 'chatCallerCandidates', 'chatCalleeCandidates')
-//     ]);
-
-//     console.log(
-//       `[✅ WIPE PASS 1 COMPLETE] Room: ${roomId} | ` +
-//       `Video(${videoRes.callerCount}/${videoRes.calleeCount}) | ` +
-//       `Voice(${voiceRes.callerCount}/${voiceRes.calleeCount}) | ` +
-//       `Chat(${chatRes.callerCount}/${chatRes.calleeCount})`
-//     );
-
-//     setTimeout(async () => {
-//       try {
-//         await Promise.all([
-//           wipeSingleCollection(firestore, 'room', roomId, 'callerCandidates', 'calleeCandidates'),
-//           wipeSingleCollection(voiceFirestore, 'voiceroom', roomId, 'callerCandidates', 'calleeCandidates'),
-//           wipeSingleCollection(chatFirestore, 'chatroom', roomId, 'chatCallerCandidates', 'chatCalleeCandidates')
-//         ]);
-//       } catch (e) {} finally {
-//         wipingRooms.delete(roomId);
-//       }
-//     }, 2500);
-
-//   } catch (err) {
-//     console.log(`[❌ WIPE ERROR] Room ${roomId}:`, err.message);
-//     wipingRooms.delete(roomId);
-//   }
-// }
-
-// // ==============================================================
-// // 🚀 HYBRID LAYER A: LIVE ROOM STATUS WATCHERS
-// // ==============================================================
-// function attachRoomStatusWatcher(dbInstance, collectionName, label) {
-//   dbInstance.collection(collectionName).onSnapshot(snapshot => {
-//     snapshot.docChanges().forEach(async change => {
-//       const roomId = change.doc.id;
-//       const data = change.doc.data() || {};
-
-//       if (change.type === 'added') {
-//         console.log(`[📞 ${label} ROOM CREATED] ID: ${roomId} | Caller: ${data.caller || 'N/A'} | Callee: ${data.callee || 'N/A'}`);
-//       }
-
-//       if ((change.type === 'added' || change.type === 'modified') && isTerminalRoomState(data)) {
-//         const action = (data.status && TERMINAL_STATUSES.includes(String(data.status).toLowerCase()))
-//           ? String(data.status).toLowerCase()
-//           : 'ended';
-
-//         if (action === 'background' && isRoomProtectedForGallery(roomId)) {
-//           return;
-//         }
-
-//         console.log(`\n[⚡ ${label} STATUS TRIGGER] Room ${roomId} marked as '${action}' by ${data.endedBy || 'user'}`);
-//         io.to(roomId).emit('call_alert', getAlertPayload(action));
-
-//         setTimeout(() => {
-//           forceWipeRoom(roomId, `${label} Status Field (${action})`);
-//         }, 600);
-//       }
-//     });
-//   }, err => {
-//     console.log(`[❌ WATCHER ERROR] ${collectionName}:`, err.message);
-//   });
-// }
-
-// attachRoomStatusWatcher(firestore, 'room', 'VIDEO');
-// attachRoomStatusWatcher(voiceFirestore, 'voiceroom', 'VOICE');
-// attachRoomStatusWatcher(chatFirestore, 'chatroom', 'CHAT');
-
-// // ==============================================================
-// // 🚀 HYBRID LAYER B: END-ROOM-REQUEST WATCHERS
-// // ==============================================================
-// function attachEndRequestWatcher(dbInstance, label) {
-//   dbInstance.collection('EndRoomRequest').onSnapshot(snapshot => {
-//     snapshot.docChanges().forEach(async change => {
-//       if (change.type === 'added') {
-//         const data = change.doc.data() || {};
-
-//         if (data.action === 'background' && isRoomProtectedForGallery(data.roomId)) {
-//           try { await change.doc.ref.delete(); } catch (err) {}
-//           return;
-//         }
-
-//         console.log(`\n[🔥 ${label} END-REQUEST] Action: '${data.action}' by ${data.by} for Room: ${data.roomId}`);
-
-//         if (data.roomId) {
-//           io.to(data.roomId).emit('call_alert', getAlertPayload(data.action));
-//           await forceWipeRoom(data.roomId, `${label} EndRoomRequest (${data.action})`);
-//         }
-
-//         try { await change.doc.ref.delete(); } catch (err) {}
-//       }
-//     });
-//   }, err => {
-//     console.log(`[❌ END-REQUEST WATCHER ERROR] ${label}:`, err.message);
-//   });
-// }
-
-// attachEndRequestWatcher(firestore, 'VIDEO');
-// attachEndRequestWatcher(voiceFirestore, 'VOICE');
-// attachEndRequestWatcher(chatFirestore, 'CHAT');
-
-// // ==============================================================
-// // 🚀 SOCKET.IO CONNECTIONS & AUTO-RECOVERY
-// // ==============================================================
-// io.on('connection', (socket) => {
-//   console.log(`[🔌 NEW SOCKET CONNECTED] ID: ${socket.id}`);
-
-//   const ensureSocketUser = (data = {}) => {
-//     if (!activeUsers.has(socket.id)) {
-//       activeUsers.set(socket.id, {
-//         uid: data.uid || null,
-//         email: data.email || null,
-//         screen: data.screen || 'Home',
-//         lastPing: Date.now(),
-//         isWatchingAd: false,
-//         inQueue: false,
-//         roomId: data.roomId || null
-//       });
-//     }
-//     const user = activeUsers.get(socket.id);
-//     if (data.uid) user.uid = data.uid;
-//     if (data.email) user.email = data.email;
-//     if (data.screen) user.screen = data.screen;
-//     user.lastPing = Date.now();
-//     return user;
-//   };
-
-//   socket.on('register_user', async (data = {}) => {
-//     const user = ensureSocketUser(data);
-//     if (data.roomId) {
-//       user.roomId = data.roomId;
-//       socket.join(data.roomId);
-//       if (pendingRoomDrops.has(data.roomId)) {
-//         clearTimeout(pendingRoomDrops.get(data.roomId));
-//         pendingRoomDrops.delete(data.roomId);
-//       }
-//     }
-//     console.log(`[👤 USER ONLINE] Email: ${user.email} | Socket: ${socket.id} | Screen: ${user.screen}`);
-//     if (user.uid) {
-//       try { await rtdb.ref(`users/${user.uid}`).update({ IsActive: true }); } catch (error) {}
-//     }
-//   });
-
-//   socket.on('set_queue_status', (data = {}) => {
-//     const user = ensureSocketUser(data);
-//     user.inQueue = !!data.inQueue;
-//   });
-
-//   socket.on('set_room_status', async (data = {}) => {
-//     const user = ensureSocketUser(data);
-//     if (user.roomId && user.roomId !== data.roomId) {
-//       socket.leave(user.roomId);
-//     }
-//     user.roomId = data.roomId || null;
-
-//     if (data.roomId) {
-//       user.inQueue = false;
-//       socket.join(data.roomId);
-
-//       if (pendingRoomDrops.has(data.roomId)) {
-//         clearTimeout(pendingRoomDrops.get(data.roomId));
-//         pendingRoomDrops.delete(data.roomId);
-//         console.log(`[🛡️ DROP CANCELLED] User ${user.email || socket.id} active in Room: ${data.roomId}`);
-//       }
-
-//       if (user.email) {
-//         await removeUserFromAllQueues(user.email);
-//       }
-//     }
-//   });
-
-//   socket.on('room_established', (data) => {
-//     if (!data) return;
-//     if (data.roomId && pendingRoomDrops.has(data.roomId)) {
-//       clearTimeout(pendingRoomDrops.get(data.roomId));
-//       pendingRoomDrops.delete(data.roomId);
-//     }
-//     console.log(`\n[🎉 CONNECTION ESTABLISHED] ${data.userA} and ${data.userB} has joined room ${data.roomId}\n`);
-//   });
-
-//   socket.on('videoend', async ({ roomId } = {}) => {
-//     if (!roomId) return;
-//     socket.to(roomId).emit('call_alert', getAlertPayload('ended'));
-//     await forceWipeRoom(roomId, 'Socket videoend');
-//   });
-
-//   socket.on('videonext', async ({ roomId } = {}) => {
-//     if (!roomId) return;
-//     socket.to(roomId).emit('call_alert', getAlertPayload('next'));
-//     await forceWipeRoom(roomId, 'Socket videonext');
-//   });
-
-//   socket.on('videobackground', async ({ roomId } = {}) => {
-//     if (!roomId) return;
-//     const user = activeUsers.get(socket.id);
-//     if (user?.isWatchingAd || isRoomProtectedForGallery(roomId)) {
-//       return;
-//     }
-//     socket.to(roomId).emit('call_alert', getAlertPayload('background'));
-//     await forceWipeRoom(roomId, 'Socket videobackground');
-//   });
-
-//   socket.on('checkInternet', async ({ roomId } = {}) => {
-//     if (!roomId) return;
-//     socket.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
-//     await forceWipeRoom(roomId, 'Socket checkInternet');
-//   });
-
-//   socket.on('ping', (data = {}) => {
-//     const user = ensureSocketUser(data);
-//     if (data.roomId && user.roomId !== data.roomId) {
-//       user.roomId = data.roomId;
-//       socket.join(data.roomId);
-//     }
-//     if (user.roomId && pendingRoomDrops.has(user.roomId)) {
-//       clearTimeout(pendingRoomDrops.get(user.roomId));
-//       pendingRoomDrops.delete(user.roomId);
-//     }
-//   });
-
-//   socket.on('ad_status', async (data = {}) => {
-//     const user = ensureSocketUser(data);
-//     user.isWatchingAd = !!data.isWatchingAd;
-
-//     const targetRoomId = data.roomId || user.roomId;
-//     if (targetRoomId && user.isWatchingAd) {
-//       protectedRoomsUntil.set(targetRoomId, Date.now() + 25000);
-//     }
-
-//     if (user.uid && user.isWatchingAd) {
-//       try { await rtdb.ref(`users/${user.uid}`).update({ IsActive: true }); } catch (e) {}
-//     }
-//   });
-
-//   socket.on('manual_disconnect', async () => {
-//     const user = activeUsers.get(socket.id);
-//     if (user?.isWatchingAd || (user?.roomId && isRoomProtectedForGallery(user.roomId))) {
-//       if (user) user.lastPing = Date.now();
-//       return;
-//     }
-//     console.log(`[⚠️ MANUAL DISCONNECT] Socket ${socket.id} (App backgrounded/closed)`);
-//     await handleUserDrop(socket.id, "App Backgrounded/Closed");
-//   });
-
-//   socket.on('disconnect', async () => {
-//     console.log(`[🔌 SOCKET LOST] ID: ${socket.id}`);
-//     await handleUserDrop(socket.id, "Socket Disconnected");
-//   });
-// });
-
-// // ==============================================================
-// // 🚀 SERVER PING CHECKER & RECONNECT-SAFE USER DROP HANDLER
-// // ==============================================================
-// setInterval(async () => {
-//   const now = Date.now();
-//   for (const [socketId, user] of activeUsers.entries()) {
-//     const timeoutThreshold = user.isWatchingAd ? 120000 : 75000;
-
-//     if (now - user.lastPing > timeoutThreshold) {
-//       console.log(`[🕒 PING DEAD] User ${user.email || user.uid} timed out.`);
-//       await handleUserDrop(socketId, "Server Ping Timeout");
-//       io.to(socketId).emit('force_disconnect');
-//     }
-//   }
-// }, 8000);
-
-// async function handleUserDrop(socketId, reason) {
-//   if (!activeUsers.has(socketId)) return;
-
-//   const user = activeUsers.get(socketId);
-//   activeUsers.delete(socketId);
-
-//   // 🛡️ CRITICAL FIX: If this user already reconnected on a new socket ID, ignore the old socket's disconnect!
-//   if (isUserConnectedOnAnySocket(user.email, user.uid)) {
-//     console.log(`[🔄 SOCKET HANDOVER] ${user.email || user.uid} is already active on a newer socket. Ignoring old socket drop.`);
-//     return;
-//   }
-
-//   if (user.isWatchingAd || (user.roomId && isRoomProtectedForGallery(user.roomId))) {
-//     const roomId = user.roomId;
-//     if (roomId && !pendingRoomDrops.has(roomId)) {
-//       const timer = setTimeout(async () => {
-//         pendingRoomDrops.delete(roomId);
-//         if (!isUserConnectedOnAnySocket(user.email, user.uid)) {
-//           io.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
-//           await forceWipeRoom(roomId, `Gallery Timeout Drop (${user.email})`);
-//         }
-//       }, 22000);
-//       pendingRoomDrops.set(roomId, timer);
-//     }
-//     return;
-//   }
-
-//   console.log(`[🧹 CLEANING USER DATA] Dropping ${user.email || socketId} | Reason: ${reason}`);
-
-//   if (user.email) {
-//     await removeUserFromAllQueues(user.email);
-//   }
-
-//   if (user.roomId) {
-//     const roomId = user.roomId;
-//     if (!pendingRoomDrops.has(roomId)) {
-//       // Give 12s for transient mobile network switches before declaring a dropped call
-//       const waitMs = reason === "App Backgrounded/Closed" ? 3000 : 12000;
-//       const timer = setTimeout(async () => {
-//         pendingRoomDrops.delete(roomId);
-//         if (isRoomProtectedForGallery(roomId)) return;
-//         if (!isUserConnectedOnAnySocket(user.email, user.uid)) {
-//           try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (e) {}
-//           io.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
-//           await forceWipeRoom(roomId, `Confirmed User Drop (${reason})`);
-//         }
-//       }, waitMs);
-//       pendingRoomDrops.set(roomId, timer);
-//     }
-//   } else {
-//     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (e) {}
-//   }
-// }
-
-// // ==============================================================
-// // ⚡ 10-SECOND QUEUE SWEEPER (VIDEO, VOICE & CHAT QUEUES)
-// // ==============================================================
-// setInterval(async () => {
-//   const sweepQueueCollection = async (dbInstance, collectionName, label) => {
-//     try {
-//       const snapshot = await dbInstance.collection(collectionName).get();
-//       if (snapshot.empty) return;
-
-//       const now = Date.now();
-//       let cleaned = 0;
-
-//       for (const docSnap of snapshot.docs) {
-//         const data = docSnap.data() || {};
-//         const email = docSnap.id;
-
-//         const createdMs = data.createdAt?.toDate ? data.createdAt.toDate().getTime() : 0;
-//         const ageMs = createdMs ? now - createdMs : 0;
-
-//         if (createdMs && ageMs > 20000) {
-//           await docSnap.ref.delete().catch(() => {});
-//           cleaned++;
-//           continue;
-//         }
-
-//         if (createdMs && ageMs > 8000) {
-//           const active = await isUserActiveInRTDB(email, data.uid);
-//           if (!active) {
-//             await docSnap.ref.delete().catch(() => {});
-//             cleaned++;
-//           }
-//         }
-//       }
-
-//       if (cleaned > 0) {
-//         console.log(`[⚡ ${label} QUEUE SWEEP] Purged ${cleaned} stale/offline queue docs from ${collectionName}.`);
-//       }
-//     } catch (error) {}
-//   };
-
-//   await Promise.all([
-//     sweepQueueCollection(firestore, 'randomQueue', 'VIDEO'),
-//     sweepQueueCollection(voiceFirestore, 'voicerandomQueue', 'VOICE'),
-//     sweepQueueCollection(chatFirestore, 'randomChatQueue', 'CHAT')
-//   ]);
-// }, 10000);
-
-// // ==============================================================
-// // 👻 GHOST ROOM SWEEPER (NEVER KILLS ACTIVE HANDSHAKEN CALLS)
-// // ==============================================================
-// setInterval(async () => {
-//   const sweepDatabaseRooms = async (dbInstance, collectionName, label) => {
-//     try {
-//       const docRefs = await dbInstance.collection(collectionName).listDocuments();
-
-//       for (const docRef of docRefs) {
-//         const roomId = docRef.id;
-//         if (
-//           wipingRooms.has(roomId) ||
-//           pendingRoomDrops.has(roomId) ||
-//           isRoomProtectedForGallery(roomId)
-//         ) {
-//           continue;
-//         }
-
-//         const docSnap = await docRef.get();
-
-//         // CASE 1: Italic Ghost Document (Parent deleted, subcollections remain)
-//         if (!docSnap.exists) {
-//           await forceWipeRoom(roomId, `${label} Italic Ghost Sweeper`);
-//           continue;
-//         }
-
-//         const data = docSnap.data() || {};
-
-//         // CASE 2: Document has a terminal status ('ended', 'next', 'background', 'disconnected')
-//         if (isTerminalRoomState(data)) {
-//           const action = data.status || 'ended';
-//           io.to(roomId).emit('call_alert', getAlertPayload(action));
-//           await forceWipeRoom(roomId, `${label} Lingering Status Sweeper`);
-//           continue;
-//         }
-
-//         // CASE 3: Malformed room missing caller or callee
-//         if (!data.caller || !data.callee) {
-//           await forceWipeRoom(roomId, `${label} Malformed Room Sweeper`);
-//           continue;
-//         }
-
-//         const createdMs = data.createdAt?.toDate ? data.createdAt.toDate().getTime() : 0;
-//         const roomAgeMs = createdMs ? Date.now() - createdMs : 0;
-
-//         if (roomAgeMs < 40000) continue;
-
-//         // CASE 4: Room older than 45s that never completed offer/answer OR chatOffer/chatAnswer handshake
-//         const hasHandshake = (data.offer && data.answer) || (data.chatOffer && data.chatAnswer);
-//         if (roomAgeMs > 45000 && !hasHandshake) {
-//           console.log(`\n[👻 UNFINISHED HANDSHAKE] ${label} ${roomId} stuck without offer/answer for >45s.`);
-//           io.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
-//           await forceWipeRoom(roomId, `${label} Unfinished Handshake Sweeper`);
-//           continue;
-//         }
-
-//         // CASE 5: Only sweep an established room if NEITHER user is connected on Socket.IO anymore
-//         const callerOnSocket = isUserConnectedOnAnySocket(data.caller);
-//         const calleeOnSocket = isUserConnectedOnAnySocket(data.callee);
-//         const roomOccupied = isRoomOccupiedOnSocket(roomId);
-
-//         if (!callerOnSocket && !calleeOnSocket && !roomOccupied) {
-//           console.log(`\n[👻 ABANDONED ROOM] ${label} ${roomId} has no connected users. Wiping...`);
-//           await forceWipeRoom(roomId, `${label} Abandoned Room Sweeper`);
-//         }
-//       }
-//     } catch (err) {}
-//   };
-
-//   await Promise.all([
-//     sweepDatabaseRooms(firestore, 'room', 'VIDEO'),
-//     sweepDatabaseRooms(voiceFirestore, 'voiceroom', 'VOICE'),
-//     sweepDatabaseRooms(chatFirestore, 'chatroom', 'CHAT')
-//   ]);
-// }, 15000);
-
-// // ==============================================================
-// // 💎 VIP SUBSCRIPTION SWEEPER (Every 1 Min)
-// // ==============================================================
-// setInterval(async () => {
-//   try {
-//     const snap = await rtdb.ref('TotalSubscriptions').once('value');
-//     if (!snap.exists()) return;
-//     const subscriptions = snap.val();
-//     const now = new Date();
-//     let expCount = 0;
-
-//     for (const [dateKey, subData] of Object.entries(subscriptions)) {
-//       const parts = dateKey.split('-');
-//       if (parts.length >= 7) {
-//         const expDate = new Date(parts[2], parts[1] - 1, parts[0], parts[3], parts[4], parts[5], parts[6]);
-//         if (expDate <= now) {
-//           if (subData.userId) {
-//             await rtdb.ref(`users/${subData.userId}/Subscription`).remove();
-//             await rtdb.ref(`users/${subData.userId}`).update({ IsVip: false });
-//           }
-//           await rtdb.ref(`TotalSubscriptions/${dateKey}`).remove();
-//           expCount++;
-//         }
-//       }
-//     }
-//     if (expCount > 0) console.log(`[💎 VIP SWEEP] Expired ${expCount} subscriptions.`);
-//   } catch (error) {}
-// }, 60000);
-
-// app.get('/', (req, res) => res.send('MeetVibe Master Quad-DB Hybrid Server Running 🚀'));
-// const PORT = process.env.PORT || 3000;
-// server.listen(PORT, '0.0.0.0', () => console.log(`\n🚀 Server listening on port ${PORT}`));
-
-
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -1050,17 +389,16 @@ console.log("[⚙️ SYSTEM] Initializing Quad Firebase Admin SDKs (RTDB, Video,
 // 1. Realtime Database (Presence & Subscriptions)
 const rtdbServiceAccount = require('./serviceAccountKey.json');
 const rtdbApp = admin.initializeApp({
-  credential: admin.credential.cert(rtdbServiceAccount),
-  databaseURL: "https://testvibe-cc69f-default-rtdb.firebaseio.com" // ⚠️ REPLACE WITH YOUR RTDB URL IF DIFFERENT
+   credential: admin.credential.cert(rtdbServiceAccount),
+  databaseURL: "https://testvibe-cc69f-default-rtdb.firebaseio.com" // ⚠️ REPLACE WITH YOUR RTDB URL
 }, 'rtdbApp');
 const rtdb = rtdbApp.database();
-
-// 2. Video Firestore (secondaryDb: room & randomQueue)
 const firestoreServiceAccount = require('./videoChatfirestoreServiceAccountKey.json');
 const firestoreApp = admin.initializeApp({
   credential: admin.credential.cert(firestoreServiceAccount)
 }, 'firestoreApp');
 const firestore = firestoreApp.firestore();
+
 
 // 3. Voice Firestore (thirdDb: voiceroom & voicerandomQueue)
 const voiceFirestoreServiceAccount = require('./voiceCallfirestoreServiceAccountKey.json');
@@ -1076,36 +414,21 @@ const chatFirestoreApp = admin.initializeApp({
 }, 'chatFirestoreApp');
 const chatFirestore = chatFirestoreApp.firestore();
 
-console.log("[✅ SYSTEM] All 4 Firebase Admin SDKs initialized successfully!");
-
 const app = express();
 app.use(cors());
-app.use(express.json());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
-  pingInterval: 2000, // 💓 2-second socket ping interval
-  pingTimeout: 5000,  // 🚨 Detect dead socket within 5 seconds
-});
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
-// ==============================================================
-// 🧠 IN-MEMORY REAL-TIME STATE MAPS
-// ==============================================================
-const activeUsers = new Map();       // socketId -> { socketId, uid, email, screen, lastPing, isWatchingAd, inQueue, joinedQueueAt, roomId, partnerEmail }
-const activeRooms = new Map();       // roomId -> { roomId, caller, callee, label, createdAt }
-const wipingRooms = new Set();       // roomId
-const pendingRoomDrops = new Map();  // roomId -> timeoutId
+const activeUsers = new Map();
+const wipingRooms = new Set();
+const pendingRoomDrops = new Map(); // roomId -> timeoutId
 const protectedRoomsUntil = new Map(); // roomId -> timestampMs
 
 const TERMINAL_STATUSES = ['ended', 'next', 'background', 'disconnected'];
-const QUEUE_PING_TIMEOUT_MS = 5000;  // 5s without a 2s ping while in queue = dead connection
-const QUEUE_MAX_TTL_MS = 10000;      // 10s max time allowed in randomQueue
-
-const normEmail = (email) => (email ? String(email).toLowerCase().trim() : null);
 
 // ==============================================================
-// 🚀 HELPERS: ALERTS, DEDUPLICATION & PRESENCE CHECK
+// 🚀 HELPERS: ALERTS & PRESENCE CHECK
 // ==============================================================
 function getAlertPayload(action) {
   if (action === 'next') {
@@ -1136,21 +459,13 @@ function isRoomProtectedForGallery(roomId) {
   return false;
 }
 
-function findUserSockets(email, uid = null) {
-  const targetEmail = normEmail(email);
-  const matches = [];
-  for (const [sockId, u] of activeUsers.entries()) {
-    const emailMatch = targetEmail && normEmail(u.email) === targetEmail;
-    const uidMatch = uid && u.uid && u.uid === uid;
-    if (emailMatch || uidMatch) {
-      matches.push({ sockId, user: u });
-    }
-  }
-  return matches;
-}
-
 function isUserConnectedOnAnySocket(email, uid = null) {
-  return findUserSockets(email, uid).length > 0;
+  const targetEmail = email ? String(email).toLowerCase() : null;
+  for (const u of activeUsers.values()) {
+    if (uid && u.uid === uid) return true;
+    if (targetEmail && u.email && String(u.email).toLowerCase() === targetEmail) return true;
+  }
+  return false;
 }
 
 function isRoomOccupiedOnSocket(roomId) {
@@ -1172,6 +487,7 @@ async function isUserActiveInRTDB(email, uid = null) {
     }
     if (!email) return true;
     const snap = await rtdb.ref('users').orderByChild('email').equalTo(email).once('value');
+    // ⚠️ Never return false if query returns empty (email casing or missing index)
     if (!snap.exists()) return true;
     const val = snap.val();
     const firstUid = Object.keys(val)[0];
@@ -1181,36 +497,13 @@ async function isUserActiveInRTDB(email, uid = null) {
   }
 }
 
-/**
- * 🗑️ Removes a user's document from Video, Voice, and Chat queues immediately
- */
-async function removeUserFromAllQueues(rawEmail, reason = "cleanup") {
-  const cleanEmail = normEmail(rawEmail);
-  const exactEmail = rawEmail ? String(rawEmail).trim() : null;
-  if (!cleanEmail) return;
-
-  console.log(`[🗑️ QUEUE DELETE] Removing ${cleanEmail} from all queues (Video/Voice/Chat) | Reason: ${reason}`);
-
-  const deleteFromDbQueue = async (dbInstance, colName) => {
-    const col = dbInstance.collection(colName);
-    const tasks = [col.doc(cleanEmail).delete().catch(() => {})];
-    if (exactEmail && exactEmail !== cleanEmail) {
-      tasks.push(col.doc(exactEmail).delete().catch(() => {}));
-    }
-    const qSnap = await col.where('email', '==', cleanEmail).get().catch(() => null);
-    if (qSnap && !qSnap.empty) {
-      qSnap.forEach((d) => tasks.push(d.ref.delete().catch(() => {})));
-    }
-    await Promise.all(tasks);
-  };
-
+async function removeUserFromAllQueues(email) {
+  if (!email) return;
   await Promise.all([
-    deleteFromDbQueue(firestore, 'randomQueue'),
-    deleteFromDbQueue(voiceFirestore, 'voicerandomQueue'),
-    deleteFromDbQueue(chatFirestore, 'randomChatQueue'),
+    firestore.collection('randomQueue').doc(email).delete().catch(() => {}),
+    voiceFirestore.collection('voicerandomQueue').doc(email).delete().catch(() => {}),
+    chatFirestore.collection('randomChatQueue').doc(email).delete().catch(() => {})
   ]);
-
-  console.log(`[✅ QUEUE DELETED] ${cleanEmail} removed from randomQueue / voicerandomQueue / randomChatQueue (${reason})`);
 }
 
 // ==============================================================
@@ -1259,7 +552,6 @@ async function forceWipeRoom(roomId, triggerMethod) {
     pendingRoomDrops.delete(roomId);
   }
   protectedRoomsUntil.delete(roomId);
-  activeRooms.delete(roomId);
 
   console.log(`\n[🛠️ DB WIPE INITIATED] Source: ${triggerMethod} | Target Room: ${roomId}`);
 
@@ -1295,70 +587,6 @@ async function forceWipeRoom(roomId, triggerMethod) {
   }
 }
 
-/**
- * 🔄 Notifies the remaining connected partner to return to the searching screen & wipes the room
- */
-async function notifyPartnerAndWipeRoom(roomId, droppedEmail, action = 'disconnected', reason = 'Partner Disconnected') {
-  const cleanDropped = normEmail(droppedEmail);
-  let partnerEmail = null;
-
-  // 1. Resolve partnerEmail from activeRooms map
-  if (roomId && activeRooms.has(roomId)) {
-    const info = activeRooms.get(roomId);
-    if (cleanDropped) {
-      partnerEmail = normEmail(info.caller) === cleanDropped
-        ? normEmail(info.callee)
-        : normEmail(info.caller);
-    }
-  }
-
-  // 2. Also check activeUsers in case partner is in the same roomId
-  for (const u of activeUsers.values()) {
-    if (roomId && u.roomId === roomId && normEmail(u.email) !== cleanDropped) {
-      partnerEmail = partnerEmail || normEmail(u.email);
-    }
-    if (cleanDropped && normEmail(u.partnerEmail) === cleanDropped) {
-      partnerEmail = partnerEmail || normEmail(u.email);
-    }
-  }
-
-  console.log(
-    `\n[🔄 PARTNER RE-QUEUE] Dropped User: ${cleanDropped || 'unknown'} | Partner: ${partnerEmail || 'room-broadcast'} | Room: ${roomId} | Reason: ${reason}`
-  );
-
-  const requeuePayload = {
-    roomId,
-    disconnectedUser: cleanDropped,
-    action,
-    reason,
-    message: "Partner disconnected. Returning to search...",
-    timestamp: Date.now(),
-  };
-
-  // Emit to the Socket.IO room
-  if (roomId) {
-    io.to(roomId).emit('call_alert', getAlertPayload(action));
-    io.to(roomId).emit('partner_disconnected_requeue', requeuePayload);
-  }
-
-  // Also emit directly to the partner's socketId (even if they haven't joined the socket room yet!)
-  if (partnerEmail) {
-    await removeUserFromAllQueues(partnerEmail, 'partner_dropped_reset');
-    const partnerSockets = findUserSockets(partnerEmail);
-    for (const { sockId, user } of partnerSockets) {
-      user.roomId = null;
-      user.partnerEmail = null;
-      io.to(sockId).emit('call_alert', getAlertPayload(action));
-      io.to(sockId).emit('partner_disconnected_requeue', requeuePayload);
-      console.log(`[📡 EMITTED partner_disconnected_requeue] -> Partner: ${partnerEmail} (Socket: ${sockId})`);
-    }
-  }
-
-  if (roomId) {
-    await forceWipeRoom(roomId, reason);
-  }
-}
-
 // ==============================================================
 // 🚀 HYBRID LAYER A: LIVE ROOM STATUS WATCHERS
 // ==============================================================
@@ -1369,20 +597,7 @@ function attachRoomStatusWatcher(dbInstance, collectionName, label) {
       const data = change.doc.data() || {};
 
       if (change.type === 'added') {
-        const caller = normEmail(data.caller);
-        const callee = normEmail(data.callee);
-        activeRooms.set(roomId, {
-          roomId,
-          caller,
-          callee,
-          label,
-          createdAt: Date.now(),
-        });
-        console.log(`[📞 ${label} ROOM CREATED] ID: ${roomId} | Caller: ${caller || 'N/A'} | Callee: ${callee || 'N/A'}`);
-
-        // Automatically remove both matched users from queues
-        if (caller) removeUserFromAllQueues(caller, `${label}_room_created`).catch(() => {});
-        if (callee) removeUserFromAllQueues(callee, `${label}_room_created`).catch(() => {});
+        console.log(`[📞 ${label} ROOM CREATED] ID: ${roomId} | Caller: ${data.caller || 'N/A'} | Callee: ${data.callee || 'N/A'}`);
       }
 
       if ((change.type === 'added' || change.type === 'modified') && isTerminalRoomState(data)) {
@@ -1391,12 +606,15 @@ function attachRoomStatusWatcher(dbInstance, collectionName, label) {
           : 'ended';
 
         if (action === 'background' && isRoomProtectedForGallery(roomId)) {
-          console.log(`[🛡️ GALLERY PROTECTED] Ignoring background status on protected room: ${roomId}`);
           return;
         }
 
         console.log(`\n[⚡ ${label} STATUS TRIGGER] Room ${roomId} marked as '${action}' by ${data.endedBy || 'user'}`);
-        await notifyPartnerAndWipeRoom(roomId, data.endedBy || null, action, `${label} Status Field (${action})`);
+        io.to(roomId).emit('call_alert', getAlertPayload(action));
+
+        setTimeout(() => {
+          forceWipeRoom(roomId, `${label} Status Field (${action})`);
+        }, 600);
       }
     });
   }, err => {
@@ -1425,12 +643,8 @@ function attachEndRequestWatcher(dbInstance, label) {
         console.log(`\n[🔥 ${label} END-REQUEST] Action: '${data.action}' by ${data.by} for Room: ${data.roomId}`);
 
         if (data.roomId) {
-          await notifyPartnerAndWipeRoom(
-            data.roomId,
-            data.by || null,
-            data.action || 'ended',
-            `${label} EndRoomRequest (${data.action})`
-          );
+          io.to(data.roomId).emit('call_alert', getAlertPayload(data.action));
+          await forceWipeRoom(data.roomId, `${label} EndRoomRequest (${data.action})`);
         }
 
         try { await change.doc.ref.delete(); } catch (err) {}
@@ -1446,67 +660,31 @@ attachEndRequestWatcher(voiceFirestore, 'VOICE');
 attachEndRequestWatcher(chatFirestore, 'CHAT');
 
 // ==============================================================
-// 🚀 SOCKET.IO CONNECTIONS, DEDUPLICATION & AUTO-RECOVERY
+// 🚀 SOCKET.IO CONNECTIONS & AUTO-RECOVERY
 // ==============================================================
 io.on('connection', (socket) => {
   console.log(`[🔌 NEW SOCKET CONNECTED] ID: ${socket.id}`);
 
-  /**
-   * 🛡️ Ensures strictly ONE socket per user (closes duplicate connections)
-   */
   const ensureSocketUser = (data = {}) => {
-    const incomingEmail = normEmail(data.email);
-    const incomingUid = data.uid || null;
-
-    // 1. Check if this user is already connected on an older socket ID -> Close duplicate!
-    if (incomingEmail || incomingUid) {
-      for (const [otherSockId, otherUser] of activeUsers.entries()) {
-        if (otherSockId === socket.id) continue;
-        const sameEmail = incomingEmail && normEmail(otherUser.email) === incomingEmail;
-        const sameUid = incomingUid && otherUser.uid && otherUser.uid === incomingUid;
-
-        if (sameEmail || sameUid) {
-          console.log(
-            `[♻️ DUPLICATE SOCKET CLOSED] User ${incomingEmail || incomingUid} connected on new socket ${socket.id}. Closing old socket ${otherSockId}.`
-          );
-          // Carry over active state before removing old socket entry
-          if (!data.roomId && otherUser.roomId) data.roomId = otherUser.roomId;
-          if (!data.partnerEmail && otherUser.partnerEmail) data.partnerEmail = otherUser.partnerEmail;
-          activeUsers.delete(otherSockId);
-          const oldSock = io.sockets.sockets.get(otherSockId);
-          if (oldSock) {
-            oldSock.disconnect(true);
-          }
-        }
-      }
-    }
-
-    // 2. Create or update current socket user record
     if (!activeUsers.has(socket.id)) {
       activeUsers.set(socket.id, {
-        socketId: socket.id,
-        uid: incomingUid,
-        email: incomingEmail,
+        uid: data.uid || null,
+        email: data.email || null,
         screen: data.screen || 'Home',
         lastPing: Date.now(),
         isWatchingAd: false,
         inQueue: false,
-        joinedQueueAt: null,
-        roomId: data.roomId || null,
-        partnerEmail: normEmail(data.partnerEmail) || null,
+        roomId: data.roomId || null
       });
     }
-
     const user = activeUsers.get(socket.id);
-    if (incomingUid) user.uid = incomingUid;
-    if (incomingEmail) user.email = incomingEmail;
+    if (data.uid) user.uid = data.uid;
+    if (data.email) user.email = data.email;
     if (data.screen) user.screen = data.screen;
-    if (data.partnerEmail) user.partnerEmail = normEmail(data.partnerEmail);
     user.lastPing = Date.now();
     return user;
   };
 
-  // 1. REGISTER USER
   socket.on('register_user', async (data = {}) => {
     const user = ensureSocketUser(data);
     if (data.roomId) {
@@ -1517,102 +695,17 @@ io.on('connection', (socket) => {
         pendingRoomDrops.delete(data.roomId);
       }
     }
-    console.log(`[👤 USER ONLINE] Email: ${user.email} | UID: ${user.uid} | Socket: ${socket.id} | Screen: ${user.screen}`);
+    console.log(`[👤 USER ONLINE] Email: ${user.email} | Socket: ${socket.id} | Screen: ${user.screen}`);
     if (user.uid) {
       try { await rtdb.ref(`users/${user.uid}`).update({ IsActive: true }); } catch (error) {}
     }
   });
 
-  // 2. JOIN QUEUE (`queue_join` / `set_queue_status`)
-  const handleQueueJoin = (data = {}) => {
+  socket.on('set_queue_status', (data = {}) => {
     const user = ensureSocketUser(data);
-    user.inQueue = true;
-    user.joinedQueueAt = Date.now();
-    user.lastPing = Date.now();
-    user.roomId = null;
-    user.partnerEmail = null;
-    console.log(`[📥 QUEUE JOIN] User: ${user.email} | Socket: ${socket.id} | Time: ${new Date(user.joinedQueueAt).toISOString()}`);
-  };
-
-  socket.on('queue_join', handleQueueJoin);
-  socket.on('join_queue', handleQueueJoin);
-
-  socket.on('set_queue_status', async (data = {}) => {
-    const user = ensureSocketUser(data);
-    if (data.inQueue) {
-      user.inQueue = true;
-      user.joinedQueueAt = user.joinedQueueAt || Date.now();
-      console.log(`[📥 SET_QUEUE_STATUS: TRUE] User: ${user.email} | Socket: ${socket.id}`);
-    } else {
-      user.inQueue = false;
-      user.joinedQueueAt = null;
-      console.log(`[📤 SET_QUEUE_STATUS: FALSE] User: ${user.email} | Socket: ${socket.id}`);
-    }
+    user.inQueue = !!data.inQueue;
   });
 
-  // 3. 2-SECOND QUEUE HEARTBEAT PING (`queue_ping`)
-  socket.on('queue_ping', (data = {}) => {
-    const user = ensureSocketUser(data);
-    user.lastPing = Date.now();
-
-    if (data.inQueue !== undefined) {
-      user.inQueue = Boolean(data.inQueue);
-      if (user.inQueue && !user.joinedQueueAt) {
-        user.joinedQueueAt = Date.now();
-      }
-    }
-    if (data.roomId) {
-      user.roomId = data.roomId;
-      socket.join(data.roomId);
-    }
-
-    const waitSec = user.joinedQueueAt ? Math.round((Date.now() - user.joinedQueueAt) / 1000) : 0;
-    console.log(
-      `[💓 2s QUEUE PING] User: ${user.email} | inQueue: ${user.inQueue} | wait: ${waitSec}s | roomId: ${user.roomId || 'none'}`
-    );
-
-    // Stamp `lastPingMs` onto the user's queue doc in Firestore so peer devices know this doc is live
-    if (user.inQueue && user.email) {
-      firestore.collection('randomQueue').doc(user.email).update({ lastPingMs: user.lastPing }).catch(() => {});
-      voiceFirestore.collection('voicerandomQueue').doc(user.email).update({ lastPingMs: user.lastPing }).catch(() => {});
-      chatFirestore.collection('randomChatQueue').doc(user.email).update({ lastPingMs: user.lastPing }).catch(() => {});
-    }
-
-    socket.emit('queue_pong', { timestamp: user.lastPing });
-  });
-
-  // 4. LEAVE / ABORT QUEUE (`queue_leave`)
-  const handleQueueLeave = async (data = {}) => {
-    const user = ensureSocketUser(data);
-    const reason = data.reason || 'client_queue_leave';
-    user.inQueue = false;
-    user.joinedQueueAt = null;
-
-    console.log(`[📤 QUEUE LEAVE] User: ${user.email} | Reason: ${reason}`);
-    if (user.email) {
-      await removeUserFromAllQueues(user.email, reason);
-    }
-
-    // If user aborted while already matched into a room during transition, notify the partner to re-queue!
-    const activeRoomId = data.roomId || user.roomId;
-    if (activeRoomId) {
-      user.roomId = null;
-      await notifyPartnerAndWipeRoom(activeRoomId, user.email, 'disconnected', `Queue Leave During Match (${reason})`);
-    }
-  };
-
-  socket.on('queue_leave', handleQueueLeave);
-  socket.on('leave_queue', handleQueueLeave);
-
-  // 5. CLEANUP STALE QUEUE DOC REPORTED BY CLIENT
-  socket.on('cleanup_stale_queue_doc', async (data = {}) => {
-    if (data?.staleEmail) {
-      console.log(`[🧹 STALE DOC REPORTED] Peer reported stale queue doc: ${data.staleEmail}`);
-      await removeUserFromAllQueues(data.staleEmail, 'peer_reported_stale');
-    }
-  });
-
-  // 6. ROOM & MATCH ESTABLISHED HANDLERS (`set_room_status`, `match_established`, `room_established`)
   socket.on('set_room_status', async (data = {}) => {
     const user = ensureSocketUser(data);
     if (user.roomId && user.roomId !== data.roomId) {
@@ -1622,7 +715,6 @@ io.on('connection', (socket) => {
 
     if (data.roomId) {
       user.inQueue = false;
-      user.joinedQueueAt = null;
       socket.join(data.roomId);
 
       if (pendingRoomDrops.has(data.roomId)) {
@@ -1632,128 +724,48 @@ io.on('connection', (socket) => {
       }
 
       if (user.email) {
-        await removeUserFromAllQueues(user.email, 'set_room_status');
+        await removeUserFromAllQueues(user.email);
       }
     }
   });
 
-  const handleMatchEstablished = async (data = {}) => {
-    const user = ensureSocketUser(data);
-    const roomId = data.roomId;
-    const partnerEmail = normEmail(data.partnerEmail || data.userB);
-
-    user.inQueue = false;
-    user.joinedQueueAt = null;
-    user.lastPing = Date.now();
-
-    if (roomId) {
-      user.roomId = roomId;
-      user.partnerEmail = partnerEmail;
-      socket.join(roomId);
-
-      if (pendingRoomDrops.has(roomId)) {
-        clearTimeout(pendingRoomDrops.get(roomId));
-        pendingRoomDrops.delete(roomId);
-      }
-
-      const existingRoom = activeRooms.get(roomId) || {};
-      activeRooms.set(roomId, {
-        roomId,
-        caller: data.role === 'caller' ? user.email : (existingRoom.caller || normEmail(data.userA) || partnerEmail),
-        callee: data.role === 'callee' ? user.email : (existingRoom.callee || normEmail(data.userB) || partnerEmail),
-        label: 'MATCH',
-        createdAt: existingRoom.createdAt || Date.now(),
-      });
+  socket.on('room_established', (data) => {
+    if (!data) return;
+    if (data.roomId && pendingRoomDrops.has(data.roomId)) {
+      clearTimeout(pendingRoomDrops.get(data.roomId));
+      pendingRoomDrops.delete(data.roomId);
     }
-
-    if (user.email) {
-      await removeUserFromAllQueues(user.email, 'match_established');
-    }
-
-    console.log(
-      `\n[🎉 CONNECTION ESTABLISHED] User: ${user.email || data.userA} <-> Partner: ${partnerEmail || data.userB} | Room: ${roomId}\n`
-    );
-
-    // Check if the partner already disconnected during the match handshake!
-    if (partnerEmail && !isUserConnectedOnAnySocket(partnerEmail)) {
-      console.log(`[⚠️ HANDSHAKE PARTNER OFFLINE] Partner ${partnerEmail} is already offline for room ${roomId}! Re-queuing ${user.email}...`);
-      await notifyPartnerAndWipeRoom(roomId, partnerEmail, 'disconnected', 'Partner Offline During Handshake');
-    }
-  };
-
-  socket.on('match_established', handleMatchEstablished);
-  socket.on('room_established', handleMatchEstablished);
-
-  // 7. CALL END / NEXT / BACKGROUND / INTERNET LOSS EVENTS
-  socket.on('videoend', async (payload = {}) => {
-    const roomId = typeof payload === 'string' ? payload : payload?.roomId;
-    const user = activeUsers.get(socket.id);
-    console.log(`[🛑 SOCKET videoend] User: ${user?.email || socket.id} | Room: ${roomId}`);
-    if (user?.email) await removeUserFromAllQueues(user.email, 'videoend');
-    if (!roomId) return;
-    await notifyPartnerAndWipeRoom(roomId, user?.email, 'ended', 'Socket videoend');
+    console.log(`\n[🎉 CONNECTION ESTABLISHED] ${data.userA} and ${data.userB} has joined room ${data.roomId}\n`);
   });
 
-  socket.on('videonext', async (payload = {}) => {
-    const roomId = typeof payload === 'string' ? payload : payload?.roomId;
-    const user = activeUsers.get(socket.id);
-    console.log(`[⏭️ SOCKET videonext] User: ${user?.email || socket.id} | Room: ${roomId}`);
-    if (user?.email) await removeUserFromAllQueues(user.email, 'videonext');
+  socket.on('videoend', async ({ roomId } = {}) => {
     if (!roomId) return;
-    await notifyPartnerAndWipeRoom(roomId, user?.email, 'next', 'Socket videonext');
+    socket.to(roomId).emit('call_alert', getAlertPayload('ended'));
+    await forceWipeRoom(roomId, 'Socket videoend');
   });
 
-  socket.on('videobackground', async (payload = {}) => {
-    const roomId = typeof payload === 'string' ? payload : payload?.roomId;
+  socket.on('videonext', async ({ roomId } = {}) => {
+    if (!roomId) return;
+    socket.to(roomId).emit('call_alert', getAlertPayload('next'));
+    await forceWipeRoom(roomId, 'Socket videonext');
+  });
+
+  socket.on('videobackground', async ({ roomId } = {}) => {
+    if (!roomId) return;
     const user = activeUsers.get(socket.id);
-    const email = normEmail(payload?.email || user?.email);
-
-    console.log(`[📱 SOCKET videobackground] User: ${email || socket.id} | Room: ${roomId}`);
-
-    if (email) {
-      await removeUserFromAllQueues(email, 'videobackground');
-    }
-    if (user) {
-      user.inQueue = false;
-      user.joinedQueueAt = null;
-    }
-
-    const targetRoomId = roomId || user?.roomId;
-    if (!targetRoomId) return;
-
-    if (user?.isWatchingAd || isRoomProtectedForGallery(targetRoomId)) {
-      console.log(`[🛡️ AD/GALLERY PROTECTED] Ignoring videobackground for Room: ${targetRoomId}`);
+    if (user?.isWatchingAd || isRoomProtectedForGallery(roomId)) {
       return;
     }
-
-    await notifyPartnerAndWipeRoom(targetRoomId, email, 'background', 'Socket videobackground');
+    socket.to(roomId).emit('call_alert', getAlertPayload('background'));
+    await forceWipeRoom(roomId, 'Socket videobackground');
   });
 
-  const handleInternetLoss = async (payload = {}) => {
-    const roomId = typeof payload === 'string' ? payload : payload?.roomId;
-    const user = activeUsers.get(socket.id);
-    const email = normEmail(payload?.email || user?.email);
+  socket.on('checkInternet', async ({ roomId } = {}) => {
+    if (!roomId) return;
+    socket.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
+    await forceWipeRoom(roomId, 'Socket checkInternet');
+  });
 
-    console.log(`[🌐 SOCKET INTERNET LOST] User: ${email || socket.id} | Room: ${roomId}`);
-
-    if (email) {
-      await removeUserFromAllQueues(email, 'internet_lost');
-    }
-    if (user) {
-      user.inQueue = false;
-      user.joinedQueueAt = null;
-    }
-
-    const targetRoomId = roomId || user?.roomId;
-    if (!targetRoomId) return;
-
-    await notifyPartnerAndWipeRoom(targetRoomId, email, 'disconnected', 'Socket checkInternet');
-  };
-
-  socket.on('checkInternet', handleInternetLoss);
-  socket.on('check_internet', handleInternetLoss);
-
-  // 8. GENERAL APP PING & AD STATUS
   socket.on('ping', (data = {}) => {
     const user = ensureSocketUser(data);
     if (data.roomId && user.roomId !== data.roomId) {
@@ -1764,7 +776,6 @@ io.on('connection', (socket) => {
       clearTimeout(pendingRoomDrops.get(user.roomId));
       pendingRoomDrops.delete(user.roomId);
     }
-    socket.emit('pong_ack', { timestamp: user.lastPing });
   });
 
   socket.on('ad_status', async (data = {}) => {
@@ -1781,65 +792,21 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 9. MANUAL DISCONNECT & SOCKET DISCONNECT (APP KILLED / NETWORK DROPPED)
   socket.on('manual_disconnect', async () => {
     const user = activeUsers.get(socket.id);
     if (user?.isWatchingAd || (user?.roomId && isRoomProtectedForGallery(user.roomId))) {
       if (user) user.lastPing = Date.now();
       return;
     }
-    console.log(`[⚠️ MANUAL DISCONNECT] Socket ${socket.id} (${user?.email || 'unknown'}) - App backgrounded/closed`);
+    console.log(`[⚠️ MANUAL DISCONNECT] Socket ${socket.id} (App backgrounded/closed)`);
     await handleUserDrop(socket.id, "App Backgrounded/Closed");
   });
 
-  socket.on('disconnect', async (reason) => {
-    const user = activeUsers.get(socket.id);
-    console.log(`[🔌 SOCKET LOST] ID: ${socket.id} | User: ${user?.email || 'unknown'} | Reason: ${reason}`);
-    await handleUserDrop(socket.id, `Socket Disconnected (${reason})`);
+  socket.on('disconnect', async () => {
+    console.log(`[🔌 SOCKET LOST] ID: ${socket.id}`);
+    await handleUserDrop(socket.id, "Socket Disconnected");
   });
 });
-
-// ==============================================================
-// ⏱️ FAST 1-SECOND QUEUE HEARTBEAT & 10-SECOND EXPIRY WATCHDOG
-// ==============================================================
-setInterval(async () => {
-  const now = Date.now();
-
-  for (const [socketId, user] of activeUsers.entries()) {
-    // 1. If user is in queue and missed 2-second pings for > 5 seconds -> delete immediately!
-    if (user.inQueue && now - user.lastPing > QUEUE_PING_TIMEOUT_MS) {
-      console.log(
-        `[🚨 QUEUE PING LOST] User ${user.email || socketId} missed 2s pings for ${Math.round(
-          (now - user.lastPing) / 1000
-        )}s! Removing from queue immediately.`
-      );
-      user.inQueue = false;
-      user.joinedQueueAt = null;
-      if (user.email) {
-        await removeUserFromAllQueues(user.email, 'missed_2s_queue_ping');
-      }
-      await handleUserDrop(socketId, "Queue 2s Ping Timeout");
-      continue;
-    }
-
-    // 2. If user has been waiting in queue for >= 10 seconds -> remove & notify device!
-    if (user.inQueue && user.joinedQueueAt && now - user.joinedQueueAt >= QUEUE_MAX_TTL_MS) {
-      console.log(`[⏰ 10s QUEUE TIMEOUT] User ${user.email} reached 10s limit in randomQueue. Removing now.`);
-      user.inQueue = false;
-      user.joinedQueueAt = null;
-
-      if (user.email) {
-        await removeUserFromAllQueues(user.email, 'server_10s_ttl_expired');
-      }
-
-      io.to(socketId).emit('queue_expired_10s', {
-        email: user.email,
-        message: "No match found within 10 seconds",
-        timestamp: now,
-      });
-    }
-  }
-}, 1000);
 
 // ==============================================================
 // 🚀 SERVER PING CHECKER & RECONNECT-SAFE USER DROP HANDLER
@@ -1863,14 +830,9 @@ async function handleUserDrop(socketId, reason) {
   const user = activeUsers.get(socketId);
   activeUsers.delete(socketId);
 
-  // Always remove from queues immediately when a socket drops!
-  if (user.email) {
-    await removeUserFromAllQueues(user.email, reason);
-  }
-
-  // 🛡️ If this user already reconnected on a newer socket ID, ignore the old socket's room drop
+  // 🛡️ CRITICAL FIX: If this user already reconnected on a new socket ID, ignore the old socket's disconnect!
   if (isUserConnectedOnAnySocket(user.email, user.uid)) {
-    console.log(`[🔄 SOCKET HANDOVER] ${user.email || user.uid} is active on a newer socket. Ignoring old socket drop.`);
+    console.log(`[🔄 SOCKET HANDOVER] ${user.email || user.uid} is already active on a newer socket. Ignoring old socket drop.`);
     return;
   }
 
@@ -1880,7 +842,8 @@ async function handleUserDrop(socketId, reason) {
       const timer = setTimeout(async () => {
         pendingRoomDrops.delete(roomId);
         if (!isUserConnectedOnAnySocket(user.email, user.uid)) {
-          await notifyPartnerAndWipeRoom(roomId, user.email, 'disconnected', `Gallery Timeout Drop (${user.email})`);
+          io.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
+          await forceWipeRoom(roomId, `Gallery Timeout Drop (${user.email})`);
         }
       }, 22000);
       pendingRoomDrops.set(roomId, timer);
@@ -1888,28 +851,37 @@ async function handleUserDrop(socketId, reason) {
     return;
   }
 
-  console.log(`[🧹 CLEANING USER DATA] Dropping ${user.email || socketId} | Room: ${user.roomId || 'none'} | Reason: ${reason}`);
+  console.log(`[🧹 CLEANING USER DATA] Dropping ${user.email || socketId} | Reason: ${reason}`);
+
+  if (user.email) {
+    await removeUserFromAllQueues(user.email);
+  }
 
   if (user.roomId) {
     const roomId = user.roomId;
-    // Immediately notify partner to re-queue & wipe room when app is killed, backgrounded, or disconnected!
-    try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (e) {}
-    await notifyPartnerAndWipeRoom(roomId, user.email, 'disconnected', `User Dropped (${reason})`);
+    if (!pendingRoomDrops.has(roomId)) {
+      // Give 12s for transient mobile network switches before declaring a dropped call
+      const waitMs = reason === "App Backgrounded/Closed" ? 3000 : 12000;
+      const timer = setTimeout(async () => {
+        pendingRoomDrops.delete(roomId);
+        if (isRoomProtectedForGallery(roomId)) return;
+        if (!isUserConnectedOnAnySocket(user.email, user.uid)) {
+          try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (e) {}
+          io.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
+          await forceWipeRoom(roomId, `Confirmed User Drop (${reason})`);
+        }
+      }, waitMs);
+      pendingRoomDrops.set(roomId, timer);
+    }
   } else {
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (e) {}
   }
 }
 
 // ==============================================================
-// ⚡ 3-SECOND AGGRESSIVE QUEUE SWEEPER (VIDEO, VOICE & CHAT QUEUES)
-// Purges any doc > 10s old, offline docs, or 1+ day old stuck docs!
+// ⚡ 10-SECOND QUEUE SWEEPER (VIDEO, VOICE & CHAT QUEUES)
 // ==============================================================
-let isSweepingQueues = false;
-
-async function sweepAllQueueCollections() {
-  if (isSweepingQueues) return;
-  isSweepingQueues = true;
-
+setInterval(async () => {
   const sweepQueueCollection = async (dbInstance, collectionName, label) => {
     try {
       const snapshot = await dbInstance.collection(collectionName).get();
@@ -1920,50 +892,20 @@ async function sweepAllQueueCollections() {
 
       for (const docSnap of snapshot.docs) {
         const data = docSnap.data() || {};
-        const docId = docSnap.id;
-        const email = normEmail(data.email || docId);
+        const email = docSnap.id;
 
-        const createdMs =
-          typeof data.createdAtMs === 'number'
-            ? data.createdAtMs
-            : data.createdAt?.toDate
-            ? data.createdAt.toDate().getTime()
-            : data.createdAt?._seconds
-            ? data.createdAt._seconds * 1000
-            : 0;
+        const createdMs = data.createdAt?.toDate ? data.createdAt.toDate().getTime() : 0;
+        const ageMs = createdMs ? now - createdMs : 0;
 
-        const lastPingMs = typeof data.lastPingMs === 'number' ? data.lastPingMs : 0;
-        const latestActivityMs = Math.max(createdMs, lastPingMs);
-        const ageMs = latestActivityMs > 0 ? now - latestActivityMs : Infinity;
-
-        // 1. Delete immediately if older than 10 seconds OR missing timestamp (e.g., 1+ day old stuck docs!)
-        if (ageMs >= QUEUE_MAX_TTL_MS + 1000) {
-          console.log(
-            `[🧹 ${label} QUEUE SWEEP] Deleting expired doc ${collectionName}/${docId} (Age: ${
-              ageMs === Infinity ? 'old/no-timestamp' : Math.round(ageMs / 1000) + 's'
-            })`
-          );
+        if (createdMs && ageMs > 20000) {
           await docSnap.ref.delete().catch(() => {});
           cleaned++;
-
-          const userSockets = findUserSockets(email, data.uid);
-          for (const { sockId, user } of userSockets) {
-            user.inQueue = false;
-            user.joinedQueueAt = null;
-            io.to(sockId).emit('queue_expired_10s', {
-              email,
-              message: "Queue timeout (10s)",
-              timestamp: now,
-            });
-          }
           continue;
         }
 
-        // 2. If doc is > 4 seconds old and user is not connected on any socket -> delete immediately!
-        if (ageMs > 4000 && !isUserConnectedOnAnySocket(email, data.uid)) {
-          const activeInRtdb = await isUserActiveInRTDB(email, data.uid);
-          if (!activeInRtdb || lastPingMs > 0) {
-            console.log(`[🧹 ${label} OFFLINE QUEUE SWEEP] Deleting disconnected user ${collectionName}/${docId}`);
+        if (createdMs && ageMs > 8000) {
+          const active = await isUserActiveInRTDB(email, data.uid);
+          if (!active) {
             await docSnap.ref.delete().catch(() => {});
             cleaned++;
           }
@@ -1971,27 +913,17 @@ async function sweepAllQueueCollections() {
       }
 
       if (cleaned > 0) {
-        console.log(`[✅ ${label} QUEUE SWEEP] Purged ${cleaned} stale/expired queue doc(s) from ${collectionName}.`);
+        console.log(`[⚡ ${label} QUEUE SWEEP] Purged ${cleaned} stale/offline queue docs from ${collectionName}.`);
       }
-    } catch (error) {
-      console.log(`[❌ ${label} QUEUE SWEEP ERROR]:`, error.message);
-    }
+    } catch (error) {}
   };
 
-  try {
-    await Promise.all([
-      sweepQueueCollection(firestore, 'randomQueue', 'VIDEO'),
-      sweepQueueCollection(voiceFirestore, 'voicerandomQueue', 'VOICE'),
-      sweepQueueCollection(chatFirestore, 'randomChatQueue', 'CHAT')
-    ]);
-  } finally {
-    isSweepingQueues = false;
-  }
-}
-
-// Run immediately on boot (cleans any 1+ day old docs right away!) and every 3 seconds
-sweepAllQueueCollections();
-setInterval(sweepAllQueueCollections, 3000);
+  await Promise.all([
+    sweepQueueCollection(firestore, 'randomQueue', 'VIDEO'),
+    sweepQueueCollection(voiceFirestore, 'voicerandomQueue', 'VOICE'),
+    sweepQueueCollection(chatFirestore, 'randomChatQueue', 'CHAT')
+  ]);
+}, 10000);
 
 // ==============================================================
 // 👻 GHOST ROOM SWEEPER (NEVER KILLS ACTIVE HANDSHAKEN CALLS)
@@ -2024,7 +956,8 @@ setInterval(async () => {
         // CASE 2: Document has a terminal status ('ended', 'next', 'background', 'disconnected')
         if (isTerminalRoomState(data)) {
           const action = data.status || 'ended';
-          await notifyPartnerAndWipeRoom(roomId, data.endedBy || null, action, `${label} Lingering Status Sweeper`);
+          io.to(roomId).emit('call_alert', getAlertPayload(action));
+          await forceWipeRoom(roomId, `${label} Lingering Status Sweeper`);
           continue;
         }
 
@@ -2043,7 +976,8 @@ setInterval(async () => {
         const hasHandshake = (data.offer && data.answer) || (data.chatOffer && data.chatAnswer);
         if (roomAgeMs > 45000 && !hasHandshake) {
           console.log(`\n[👻 UNFINISHED HANDSHAKE] ${label} ${roomId} stuck without offer/answer for >45s.`);
-          await notifyPartnerAndWipeRoom(roomId, null, 'disconnected', `${label} Unfinished Handshake Sweeper`);
+          io.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
+          await forceWipeRoom(roomId, `${label} Unfinished Handshake Sweeper`);
           continue;
         }
 
@@ -2066,6 +1000,35 @@ setInterval(async () => {
     sweepDatabaseRooms(chatFirestore, 'chatroom', 'CHAT')
   ]);
 }, 15000);
+
+// ==============================================================
+// 💎 VIP SUBSCRIPTION SWEEPER (Every 1 Min)
+// ==============================================================
+setInterval(async () => {
+  try {
+    const snap = await rtdb.ref('TotalSubscriptions').once('value');
+    if (!snap.exists()) return;
+    const subscriptions = snap.val();
+    const now = new Date();
+    let expCount = 0;
+
+    for (const [dateKey, subData] of Object.entries(subscriptions)) {
+      const parts = dateKey.split('-');
+      if (parts.length >= 7) {
+        const expDate = new Date(parts[2], parts[1] - 1, parts[0], parts[3], parts[4], parts[5], parts[6]);
+        if (expDate <= now) {
+          if (subData.userId) {
+            await rtdb.ref(`users/${subData.userId}/Subscription`).remove();
+            await rtdb.ref(`users/${subData.userId}`).update({ IsVip: false });
+          }
+          await rtdb.ref(`TotalSubscriptions/${dateKey}`).remove();
+          expCount++;
+        }
+      }
+    }
+    if (expCount > 0) console.log(`[💎 VIP SWEEP] Expired ${expCount} subscriptions.`);
+  } catch (error) {}
+}, 60000);
 
 app.get('/', (req, res) => res.send('MeetVibe Master Quad-DB Hybrid Server Running 🚀'));
 const PORT = process.env.PORT || 3000;
