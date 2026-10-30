@@ -1100,8 +1100,8 @@ const protectedRoomsUntil = new Map();  // roomId -> timestampMs
 const recentlyAbortedUsers = new Map(); // normEmail -> timestampMs (Blocks simultaneous room creation when user clicks Abort & Leave)
 
 const TERMINAL_STATUSES = ['ended', 'next', 'background', 'left', 'disconnected'];
-const QUEUE_PING_TIMEOUT_MS = 5500;     // 5.5s without a 2s ping while in randomQueue / voicerandomQueue = lost connection
-const QUEUE_MAX_TTL_MS = 10000;         // 10s max time allowed in randomQueue / voicerandomQueue
+const QUEUE_PING_TIMEOUT_MS = 5500;     // 5.5s without a 2s ping while in randomQueue / voicerandomQueue / randomChatQueue = lost connection
+const QUEUE_MAX_TTL_MS = 10000;         // 10s max time allowed in randomQueue / voicerandomQueue / randomChatQueue
 
 const normEmail = (email) => (email ? String(email).toLowerCase().trim() : null);
 
@@ -1308,7 +1308,7 @@ async function forceWipeRoom(roomId, triggerMethod) {
 }
 
 /**
- * 🔄 Alerts the remaining connected partner ("User Has Left" or "Connection Lost") & wipes the broken room (Video & Voice)
+ * 🔄 Alerts the remaining connected partner ("User Has Left" or "Connection Lost") & wipes the broken room (Video, Voice & Chat)
  */
 async function notifyPartnerAndWipeRoom(
   roomId,
@@ -1338,7 +1338,10 @@ async function notifyPartnerAndWipeRoom(
   for (const u of activeUsers.values()) {
     if (u.roomId === roomId && normEmail(u.email) !== cleanDropped) {
       partnerEmail = partnerEmail || normEmail(u.email);
-      if (!roomLabel && u.mode === 'voice') roomLabel = 'VOICE';
+      if (!roomLabel) {
+        if (u.mode === 'voice') roomLabel = 'VOICE';
+        else if (u.mode === 'chat') roomLabel = 'CHAT';
+      }
     }
     if (cleanDropped && normEmail(u.partnerEmail) === cleanDropped) {
       partnerEmail = partnerEmail || normEmail(u.email);
@@ -1350,7 +1353,7 @@ async function notifyPartnerAndWipeRoom(
     `\n[🔄 PARTNER ALERT & WIPE] Dropped: ${cleanDropped || 'unknown'} | Partner: ${partnerEmail || 'room-broadcast'} | Room: ${roomId} | Mode: ${roomLabel || 'AUTO'} | Action: ${normalizedAction} | Reason: ${reason}`
   );
 
-  // 1. Update Firestore `room/{roomId}` (Video) and `voiceroom/{roomId}` (Voice) status so `onSnapshot` catches it immediately
+  // 1. Update Firestore `room` (Video), `voiceroom` (Voice), or `chatroom` (Chat) status so `onSnapshot` catches it immediately
   const statusPayload = {
     status: normalizedAction,
     endedBy: droppedEmail || 'server',
@@ -1360,12 +1363,15 @@ async function notifyPartnerAndWipeRoom(
   try {
     if (roomLabel === 'VOICE') {
       await voiceFirestore.collection('voiceroom').doc(roomId).set(statusPayload, { merge: true });
+    } else if (roomLabel === 'CHAT') {
+      await chatFirestore.collection('chatroom').doc(roomId).set(statusPayload, { merge: true });
     } else if (roomLabel === 'VIDEO') {
       await firestore.collection('room').doc(roomId).set(statusPayload, { merge: true });
     } else {
       await Promise.all([
         firestore.collection('room').doc(roomId).update(statusPayload).catch(() => {}),
         voiceFirestore.collection('voiceroom').doc(roomId).update(statusPayload).catch(() => {}),
+        chatFirestore.collection('chatroom').doc(roomId).update(statusPayload).catch(() => {}),
       ]);
     }
   } catch (e) {}
@@ -1556,6 +1562,13 @@ attachEndRequestWatcher(chatFirestore, 'CHAT');
 io.on('connection', (socket) => {
   console.log(`[🔌 NEW SOCKET CONNECTED] ID: ${socket.id}`);
 
+  const resolveModeFromScreen = (screen, explicitMode) => {
+    if (explicitMode) return explicitMode;
+    if (screen === 'RandomVoiceConnectingScreen' || screen === 'InCallScreenVoice') return 'voice';
+    if (screen === 'RandomChatConnectingScreen' || screen === 'RandomChatScreen') return 'chat';
+    return 'video';
+  };
+
   const ensureSocketUser = (data = {}) => {
     const incomingEmail = data.email ? String(data.email).trim() : null;
     const incomingNorm = normEmail(incomingEmail);
@@ -1585,7 +1598,7 @@ io.on('connection', (socket) => {
         uid: incomingUid,
         email: incomingEmail,
         screen: data.screen || 'Home',
-        mode: data.mode || (data.screen === 'RandomVoiceConnectingScreen' ? 'voice' : 'video'),
+        mode: resolveModeFromScreen(data.screen, data.mode),
         lastPing: Date.now(),
         isWatchingAd: false,
         inQueue: false,
@@ -1601,6 +1614,7 @@ io.on('connection', (socket) => {
     if (data.screen) user.screen = data.screen;
     if (data.mode) user.mode = data.mode;
     if (data.screen === 'RandomVoiceConnectingScreen') user.mode = 'voice';
+    if (data.screen === 'RandomChatConnectingScreen') user.mode = 'chat';
     if (data.screen === 'RandomConnectingScreen') user.mode = 'video';
     if (data.partnerEmail) user.partnerEmail = data.partnerEmail;
     user.lastPing = Date.now();
@@ -1636,6 +1650,9 @@ io.on('connection', (socket) => {
     if (data.mode === 'voice' || data.screen === 'RandomVoiceConnectingScreen' || user.screen === 'RandomVoiceConnectingScreen') {
       user.screen = 'RandomVoiceConnectingScreen';
       user.mode = 'voice';
+    } else if (data.mode === 'chat' || data.screen === 'RandomChatConnectingScreen' || user.screen === 'RandomChatConnectingScreen') {
+      user.screen = 'RandomChatConnectingScreen';
+      user.mode = 'chat';
     } else {
       user.screen = 'RandomConnectingScreen';
       user.mode = 'video';
@@ -1660,6 +1677,9 @@ io.on('connection', (socket) => {
       if (data.mode === 'voice' || user.screen === 'RandomVoiceConnectingScreen') {
         user.screen = 'RandomVoiceConnectingScreen';
         user.mode = 'voice';
+      } else if (data.mode === 'chat' || user.screen === 'RandomChatConnectingScreen') {
+        user.screen = 'RandomChatConnectingScreen';
+        user.mode = 'chat';
       } else {
         user.screen = 'RandomConnectingScreen';
         user.mode = 'video';
@@ -1725,7 +1745,6 @@ io.on('connection', (socket) => {
     }
 
     if (data.explicitAbort) {
-      // Find if user had `data.roomId`, `user.roomId`, OR if a room was created in the last 3 seconds with this user!
       let roomToCancel = data.roomId || user.roomId || null;
       let partnerToNotify = data.partnerEmail || user.partnerEmail || null;
 
@@ -1768,7 +1787,9 @@ io.on('connection', (socket) => {
     const roomId = data.roomId;
     const partnerEmail = data.partnerEmail || data.userB || null;
     const isVoice = data.mode === 'voice' || user.mode === 'voice' || user.screen === 'RandomVoiceConnectingScreen';
-    const roomLabel = isVoice ? 'VOICE' : 'VIDEO';
+    const isChat = data.mode === 'chat' || user.mode === 'chat' || user.screen === 'RandomChatConnectingScreen';
+    const roomLabel = isVoice ? 'VOICE' : isChat ? 'CHAT' : 'VIDEO';
+    const modeStr = roomLabel.toLowerCase();
 
     // 🛑 If either user clicked ABORT & LEAVE right as `match_established` was sent, cancel immediately!
     if (isUserRecentlyAborted(user.email) || isUserRecentlyAborted(partnerEmail)) {
@@ -1815,7 +1836,7 @@ io.on('connection', (socket) => {
 
           io.to(sockId).emit('match_established_sync', {
             roomId,
-            mode: isVoice ? 'voice' : 'video',
+            mode: modeStr,
             role: data.role === 'caller' ? 'callee' : 'caller',
             partnerEmail: user.email,
           });
@@ -1838,7 +1859,8 @@ io.on('connection', (socket) => {
   socket.on('entered_incall', async (data = {}) => {
     const user = ensureSocketUser(data);
     const isVoice = data.mode === 'voice' || user.mode === 'voice' || user.screen === 'RandomVoiceConnectingScreen';
-    user.screen = isVoice ? 'InCallScreenVoice' : 'InCall';
+    const isChat = data.mode === 'chat' || user.mode === 'chat' || user.screen === 'RandomChatConnectingScreen';
+    user.screen = isVoice ? 'InCallScreenVoice' : isChat ? 'RandomChatScreen' : 'InCall';
     user.inQueue = false;
     user.joinedQueueAt = null;
 
@@ -1877,32 +1899,34 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 6. CALL END / NEXT / BACKGROUND / INTERNET LOSS EVENTS (VIDEO & VOICE)
+  // 6. CALL / CHAT END / NEXT / BACKGROUND / INTERNET LOSS EVENTS (VIDEO, VOICE & CHAT)
   const handleCallEnd = async (payload = {}) => {
     const roomId = typeof payload === 'string' ? payload : payload?.roomId;
     const user = activeUsers.get(socket.id);
-    console.log(`[🛑 SOCKET CALL END] User: ${user?.email || socket.id} | Room: ${roomId}`);
-    if (user?.email) await removeUserFromAllQueues(user.email, 'videoend');
+    console.log(`[🛑 SOCKET CALL/CHAT END] User: ${user?.email || socket.id} | Room: ${roomId}`);
+    if (user?.email) await removeUserFromAllQueues(user.email, 'call_end');
     if (!roomId) return;
     socket.to(roomId).emit('call_alert', getAlertPayload('ended'));
-    await forceWipeRoom(roomId, 'Socket videoend/voiceend');
+    await forceWipeRoom(roomId, 'Socket videoend/voiceend/chatend');
   };
 
   socket.on('videoend', handleCallEnd);
   socket.on('voiceend', handleCallEnd);
+  socket.on('chatend', handleCallEnd);
 
   const handleCallNext = async (payload = {}) => {
     const roomId = typeof payload === 'string' ? payload : payload?.roomId;
     const user = activeUsers.get(socket.id);
-    console.log(`[⏭️ SOCKET CALL NEXT] User: ${user?.email || socket.id} | Room: ${roomId}`);
-    if (user?.email) await removeUserFromAllQueues(user.email, 'videonext');
+    console.log(`[⏭️ SOCKET CALL/CHAT NEXT] User: ${user?.email || socket.id} | Room: ${roomId}`);
+    if (user?.email) await removeUserFromAllQueues(user.email, 'call_next');
     if (!roomId) return;
     socket.to(roomId).emit('call_alert', getAlertPayload('next'));
-    await forceWipeRoom(roomId, 'Socket videonext/voicenext');
+    await forceWipeRoom(roomId, 'Socket videonext/voicenext/chatnext');
   };
 
   socket.on('videonext', handleCallNext);
   socket.on('voicenext', handleCallNext);
+  socket.on('chatnext', handleCallNext);
 
   const handleCallBackground = async (payload = {}) => {
     const roomId = typeof payload === 'string' ? payload : payload?.roomId;
@@ -1912,14 +1936,14 @@ io.on('connection', (socket) => {
 
     if (email) {
       recentlyAbortedUsers.set(normEmail(email), Date.now());
-      await removeUserFromAllQueues(email, 'videobackground');
+      await removeUserFromAllQueues(email, 'call_background');
     }
     if (user) {
       user.inQueue = false;
       user.joinedQueueAt = null;
     }
 
-    console.log(`[📱 SOCKET CALL BACKGROUND] User: ${email || socket.id} | Room: ${roomId}`);
+    console.log(`[📱 SOCKET CALL/CHAT BACKGROUND] User: ${email || socket.id} | Room: ${roomId}`);
 
     const targetRoomId = roomId || user?.roomId;
     if (!targetRoomId) return;
@@ -1929,11 +1953,12 @@ io.on('connection', (socket) => {
       return;
     }
 
-    await notifyPartnerAndWipeRoom(targetRoomId, email, 'left', 'Socket videobackground/voicebackground', partnerEmail);
+    await notifyPartnerAndWipeRoom(targetRoomId, email, 'left', 'Socket background/left', partnerEmail);
   };
 
   socket.on('videobackground', handleCallBackground);
   socket.on('voicebackground', handleCallBackground);
+  socket.on('chatbackground', handleCallBackground);
 
   const handleInternetLoss = async (payload = {}) => {
     const roomId = typeof payload === 'string' ? payload : payload?.roomId;
@@ -2020,7 +2045,7 @@ setInterval(async () => {
   for (const [socketId, user] of activeUsers.entries()) {
     if (!user.inQueue || user.roomId) continue;
 
-    // 1. If user is searching in queue and missed 2-second pings for > 5.5s -> remove from randomQueue / voicerandomQueue immediately!
+    // 1. If user is searching in queue and missed 2-second pings for > 5.5s -> remove from randomQueue / voicerandomQueue / randomChatQueue immediately!
     if (now - user.lastPing > QUEUE_PING_TIMEOUT_MS) {
       console.log(
         `[🚨 QUEUE PING LOST] User ${user.email || socketId} missed 2s pings for ${Math.round(
@@ -2121,7 +2146,8 @@ async function handleUserDrop(socketId, reason) {
     if (!pendingRoomDrops.has(roomId)) {
       const isConnectingScreen =
         user.screen === 'RandomConnectingScreen' ||
-        user.screen === 'RandomVoiceConnectingScreen';
+        user.screen === 'RandomVoiceConnectingScreen' ||
+        user.screen === 'RandomChatConnectingScreen';
       const waitMs = isConnectingScreen ? 1200 : 12000;
 
       const timer = setTimeout(async () => {
