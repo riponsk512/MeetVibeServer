@@ -1086,7 +1086,7 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
   pingInterval: 2000, // 💓 2-second socket ping
-  pingTimeout: 6000,  // 6-second disconnect threshold
+  pingTimeout: 5000,  // 5-second disconnect detection
 });
 
 // ==============================================================
@@ -1099,7 +1099,7 @@ const pendingRoomDrops = new Map();    // roomId -> timeoutId
 const protectedRoomsUntil = new Map(); // roomId -> timestampMs
 
 const TERMINAL_STATUSES = ['ended', 'next', 'background', 'disconnected'];
-const QUEUE_PING_TIMEOUT_MS = 5500;    // 5.5s without a 2s ping while in queue = lost connection
+const QUEUE_PING_TIMEOUT_MS = 5000;    // 5s without a 2s ping while in queue = lost connection
 const QUEUE_MAX_TTL_MS = 10000;        // 10s max time allowed in randomQueue
 
 const normEmail = (email) => (email ? String(email).toLowerCase().trim() : null);
@@ -1295,25 +1295,30 @@ async function forceWipeRoom(roomId, triggerMethod) {
 }
 
 /**
- * 🔄 Alerts the remaining connected partner ("User Has Left" or "Connection Lost") & wipes the broken room
+ * 🔄 Immediately alerts the remaining connected partner ("User Has Left" or "Connection Lost") & wipes the broken room
  */
-async function notifyPartnerAndWipeRoom(roomId, droppedEmail, action = 'disconnected', reason = 'Partner Disconnected') {
+async function notifyPartnerAndWipeRoom(roomId, droppedEmail, action = 'disconnected', reason = 'Partner Disconnected', fallbackPartnerEmail = null) {
   if (!roomId || wipingRooms.has(roomId)) return;
 
   const cleanDropped = normEmail(droppedEmail);
-  let partnerEmail = null;
+  let partnerEmail = normEmail(fallbackPartnerEmail);
 
   if (activeRooms.has(roomId)) {
     const info = activeRooms.get(roomId);
     if (cleanDropped) {
-      partnerEmail = normEmail(info.caller) === cleanDropped
-        ? normEmail(info.callee)
-        : normEmail(info.caller);
+      partnerEmail = partnerEmail || (
+        normEmail(info.caller) === cleanDropped
+          ? normEmail(info.callee)
+          : normEmail(info.caller)
+      );
     }
   }
 
   for (const u of activeUsers.values()) {
     if (u.roomId === roomId && normEmail(u.email) !== cleanDropped) {
+      partnerEmail = partnerEmail || normEmail(u.email);
+    }
+    if (cleanDropped && normEmail(u.partnerEmail) === cleanDropped) {
       partnerEmail = partnerEmail || normEmail(u.email);
     }
   }
@@ -1333,11 +1338,11 @@ async function notifyPartnerAndWipeRoom(roomId, droppedEmail, action = 'disconne
     timestamp: Date.now(),
   };
 
-  // Emit to the Socket.IO room (for InCall screen)
+  // 1. Emit to the Socket.IO room
   io.to(roomId).emit('call_alert', alertPayload);
   io.to(roomId).emit('partner_disconnected_requeue', requeuePayload);
 
-  // Also emit directly to partner's socketId (in case partner is still on RandomConnectingScreen)
+  // 2. Also emit directly to partner's socketId (crucial during the 2-second hold on RandomConnectingScreen!)
   if (partnerEmail) {
     const partnerSockets = findUserSockets(partnerEmail);
     for (const { sockId, user } of partnerSockets) {
@@ -1373,9 +1378,42 @@ function attachRoomStatusWatcher(dbInstance, collectionName, label) {
         });
         console.log(`[📞 ${label} ROOM CREATED] ID: ${roomId} | Caller: ${data.caller || 'N/A'} | Callee: ${data.callee || 'N/A'}`);
 
-        // Automatically remove both matched users from randomQueue
-        if (data.caller) removeUserFromAllQueues(data.caller, `${label}_room_created`).catch(() => {});
-        if (data.callee) removeUserFromAllQueues(data.callee, `${label}_room_created`).catch(() => {});
+        // ⚡ Instant Dual-User Sync: Notify both caller and callee sockets in 0ms so both show "CONNECTION ESTABLISHED" simultaneously!
+        if (caller) {
+          const callerSockets = findUserSockets(caller);
+          for (const { sockId, user } of callerSockets) {
+            user.inQueue = false;
+            user.joinedQueueAt = null;
+            user.roomId = roomId;
+            user.partnerEmail = data.callee || callee;
+            const s = io.sockets.sockets.get(sockId);
+            if (s) s.join(roomId);
+            io.to(sockId).emit('match_established_sync', {
+              roomId,
+              role: 'caller',
+              partnerEmail: data.callee || callee,
+            });
+          }
+          removeUserFromAllQueues(data.caller, `${label}_room_created`).catch(() => {});
+        }
+
+        if (callee) {
+          const calleeSockets = findUserSockets(callee);
+          for (const { sockId, user } of calleeSockets) {
+            user.inQueue = false;
+            user.joinedQueueAt = null;
+            user.roomId = roomId;
+            user.partnerEmail = data.caller || caller;
+            const s = io.sockets.sockets.get(sockId);
+            if (s) s.join(roomId);
+            io.to(sockId).emit('match_established_sync', {
+              roomId,
+              role: 'callee',
+              partnerEmail: data.caller || caller,
+            });
+          }
+          removeUserFromAllQueues(data.callee, `${label}_room_created`).catch(() => {});
+        }
       }
 
       if ((change.type === 'added' || change.type === 'modified') && isTerminalRoomState(data)) {
@@ -1389,16 +1427,7 @@ function attachRoomStatusWatcher(dbInstance, collectionName, label) {
         }
 
         console.log(`\n[⚡ ${label} STATUS TRIGGER] Room ${roomId} marked as '${action}' by ${data.endedBy || 'user'}`);
-        io.to(roomId).emit('call_alert', getAlertPayload(action));
-        io.to(roomId).emit('partner_disconnected_requeue', {
-          roomId,
-          action,
-          reason: `${label} Status (${action})`,
-        });
-
-        setTimeout(() => {
-          forceWipeRoom(roomId, `${label} Status Field (${action})`);
-        }, 600);
+        await notifyPartnerAndWipeRoom(roomId, data.endedBy || null, action, `${label} Status Field (${action})`);
       }
     });
   }, err => {
@@ -1552,12 +1581,11 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 3. 2-SECOND QUEUE HEARTBEAT PING (`queue_ping` — IN-MEMORY ONLY, NO FIRESTORE CONTENTION)
+  // 3. 2-SECOND QUEUE HEARTBEAT PING (`queue_ping` — IN-MEMORY ONLY)
   socket.on('queue_ping', (data = {}) => {
     const user = ensureSocketUser(data);
     user.lastPing = Date.now();
 
-    // Only mark inQueue if user is not already in an active room
     if (!user.roomId && data.inQueue !== undefined) {
       user.inQueue = Boolean(data.inQueue);
       if (user.inQueue && !user.joinedQueueAt) {
@@ -1591,11 +1619,16 @@ io.on('connection', (socket) => {
       await removeUserFromAllQueues(user.email, reason);
     }
 
-    // ONLY wipe a room if the client explicitly passed `data.roomId` (e.g. user aborted/backgrounded during handshake)
     if (data.roomId) {
       user.roomId = null;
       const dropAction = reason.includes('internet') ? 'disconnected' : 'background';
-      await notifyPartnerAndWipeRoom(data.roomId, user.email, dropAction, `Queue Leave (${reason})`);
+      await notifyPartnerAndWipeRoom(
+        data.roomId,
+        user.email,
+        dropAction,
+        `Queue Leave (${reason})`,
+        data.partnerEmail || user.partnerEmail
+      );
     }
   };
 
@@ -1632,7 +1665,6 @@ io.on('connection', (socket) => {
     const roomId = data.roomId;
     const partnerEmail = data.partnerEmail || data.userB || null;
 
-    // Stop queue timers for this user immediately so the 10s/2s queue watchdog never touches them!
     user.inQueue = false;
     user.joinedQueueAt = null;
     user.lastPing = Date.now();
@@ -1656,7 +1688,7 @@ io.on('connection', (socket) => {
         createdAt: existingRoom.createdAt || Date.now(),
       });
 
-      // Also mark partner's active socket as out of queue and in this room
+      // ⚡ Immediately relay `match_established_sync` to the partner's socket so BOTH devices enter the 2s hold together!
       if (partnerEmail) {
         const partnerSockets = findUserSockets(partnerEmail);
         for (const { sockId, user: pUser } of partnerSockets) {
@@ -1666,6 +1698,12 @@ io.on('connection', (socket) => {
           pUser.partnerEmail = user.email;
           const pSock = io.sockets.sockets.get(sockId);
           if (pSock) pSock.join(roomId);
+
+          io.to(sockId).emit('match_established_sync', {
+            roomId,
+            role: data.role === 'caller' ? 'callee' : 'caller',
+            partnerEmail: user.email,
+          });
         }
       }
     }
@@ -1675,7 +1713,7 @@ io.on('connection', (socket) => {
     }
 
     console.log(
-      `\n[🎉 CONNECTION ESTABLISHED] User: ${user.email || data.userA} <-> Partner: ${partnerEmail || data.userB} | Room: ${roomId}\n`
+      `\n[🎉 CONNECTION ESTABLISHED (2s VERIFICATION HOLD)] User: ${user.email || data.userA} <-> Partner: ${partnerEmail || data.userB} | Room: ${roomId}\n`
     );
   };
 
@@ -1689,8 +1727,7 @@ io.on('connection', (socket) => {
     console.log(`[🛑 SOCKET videoend] User: ${user?.email || socket.id} | Room: ${roomId}`);
     if (user?.email) await removeUserFromAllQueues(user.email, 'videoend');
     if (!roomId) return;
-    socket.to(roomId).emit('call_alert', getAlertPayload('ended'));
-    await forceWipeRoom(roomId, 'Socket videoend');
+    await notifyPartnerAndWipeRoom(roomId, user?.email, 'ended', 'Socket videoend', user?.partnerEmail);
   });
 
   socket.on('videonext', async (payload = {}) => {
@@ -1699,14 +1736,14 @@ io.on('connection', (socket) => {
     console.log(`[⏭️ SOCKET videonext] User: ${user?.email || socket.id} | Room: ${roomId}`);
     if (user?.email) await removeUserFromAllQueues(user.email, 'videonext');
     if (!roomId) return;
-    socket.to(roomId).emit('call_alert', getAlertPayload('next'));
-    await forceWipeRoom(roomId, 'Socket videonext');
+    await notifyPartnerAndWipeRoom(roomId, user?.email, 'next', 'Socket videonext', user?.partnerEmail);
   });
 
   socket.on('videobackground', async (payload = {}) => {
     const roomId = typeof payload === 'string' ? payload : payload?.roomId;
     const user = activeUsers.get(socket.id);
     const email = payload?.email || user?.email;
+    const partnerEmail = payload?.partnerEmail || user?.partnerEmail;
 
     console.log(`[📱 SOCKET videobackground] User: ${email || socket.id} | Room: ${roomId}`);
 
@@ -1726,13 +1763,14 @@ io.on('connection', (socket) => {
       return;
     }
 
-    await notifyPartnerAndWipeRoom(targetRoomId, email, 'background', 'Socket videobackground');
+    await notifyPartnerAndWipeRoom(targetRoomId, email, 'background', 'Socket videobackground', partnerEmail);
   });
 
   const handleInternetLoss = async (payload = {}) => {
     const roomId = typeof payload === 'string' ? payload : payload?.roomId;
     const user = activeUsers.get(socket.id);
     const email = payload?.email || user?.email;
+    const partnerEmail = payload?.partnerEmail || user?.partnerEmail;
 
     console.log(`[🌐 SOCKET INTERNET LOST] User: ${email || socket.id} | Room: ${roomId}`);
 
@@ -1747,7 +1785,7 @@ io.on('connection', (socket) => {
     const targetRoomId = roomId || user?.roomId;
     if (!targetRoomId) return;
 
-    await notifyPartnerAndWipeRoom(targetRoomId, email, 'disconnected', 'Socket checkInternet');
+    await notifyPartnerAndWipeRoom(targetRoomId, email, 'disconnected', 'Socket checkInternet', partnerEmail);
   };
 
   socket.on('checkInternet', handleInternetLoss);
@@ -1802,16 +1840,14 @@ io.on('connection', (socket) => {
 
 // ==============================================================
 // ⏱️ FAST 1-SECOND QUEUE HEARTBEAT & 10-SECOND EXPIRY WATCHDOG
-// (ONLY touches users who are actively searching in `randomQueue` — NEVER kills active calls!)
 // ==============================================================
 setInterval(async () => {
   const now = Date.now();
 
   for (const [socketId, user] of activeUsers.entries()) {
-    // Skip users who are already in a call room!
     if (!user.inQueue || user.roomId) continue;
 
-    // 1. If user is in queue and missed 2-second pings for > 5.5s -> remove from randomQueue immediately!
+    // 1. If user is in queue and missed 2-second pings for > 5s -> remove from randomQueue immediately!
     if (now - user.lastPing > QUEUE_PING_TIMEOUT_MS) {
       console.log(
         `[🚨 QUEUE PING LOST] User ${user.email || socketId} missed 2s pings for ${Math.round(
@@ -1846,7 +1882,7 @@ setInterval(async () => {
 }, 1000);
 
 // ==============================================================
-// 🚀 SERVER PING CHECKER & RECONNECT-SAFE USER DROP HANDLER
+// 🚀 SERVER PING CHECKER & INSTANT DROP HANDLER
 // ==============================================================
 setInterval(async () => {
   const now = Date.now();
@@ -1872,7 +1908,7 @@ async function handleUserDrop(socketId, reason) {
     await removeUserFromAllQueues(user.email, reason);
   }
 
-  // 🛡️ CRITICAL FIX: If this user already reconnected on a new socket ID, ignore the old socket's disconnect!
+  // 🛡️ If this user already reconnected on a new socket ID, ignore the old socket's disconnect
   if (isUserConnectedOnAnySocket(user.email, user.uid)) {
     console.log(`[🔄 SOCKET HANDOVER] ${user.email || user.uid} is already active on a newer socket. Ignoring old socket drop.`);
     return;
@@ -1884,7 +1920,7 @@ async function handleUserDrop(socketId, reason) {
       const timer = setTimeout(async () => {
         pendingRoomDrops.delete(roomId);
         if (!isUserConnectedOnAnySocket(user.email, user.uid)) {
-          await notifyPartnerAndWipeRoom(roomId, user.email, 'disconnected', `Gallery Timeout Drop (${user.email})`);
+          await notifyPartnerAndWipeRoom(roomId, user.email, 'disconnected', `Gallery Timeout Drop (${user.email})`, user.partnerEmail);
         }
       }, 22000);
       pendingRoomDrops.set(roomId, timer);
@@ -1892,31 +1928,31 @@ async function handleUserDrop(socketId, reason) {
     return;
   }
 
-  console.log(`[🧹 CLEANING USER DATA] Dropping ${user.email || socketId} | Room: ${user.roomId || 'none'} | Reason: ${reason}`);
+  console.log(`[🧹 CLEANING USER DATA] Dropping ${user.email || socketId} | Room: ${user.roomId || 'none'} | Screen: ${user.screen} | Reason: ${reason}`);
 
   if (user.roomId) {
     const roomId = user.roomId;
-    const isBackgroundOrKill = reason.includes("Backgrounded") || reason.includes("Closed");
+    try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (e) {}
 
-    if (isBackgroundOrKill) {
-      // User explicitly went to background or closed the app -> notify partner immediately!
-      try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (e) {}
-      await notifyPartnerAndWipeRoom(roomId, user.email, 'background', reason);
-    } else if (!pendingRoomDrops.has(roomId)) {
-      // Socket disconnected (network drop or app killed) -> wait 3s for any transient reconnect, then alert partner & wipe!
-      const timer = setTimeout(async () => {
-        pendingRoomDrops.delete(roomId);
-        if (isRoomProtectedForGallery(roomId)) return;
-        if (!isUserConnectedOnAnySocket(user.email, user.uid)) {
-          try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (e) {}
-          const dropAction = reason.includes("transport close") || reason.includes("client namespace disconnect")
-            ? 'background'
-            : 'disconnected';
-          await notifyPartnerAndWipeRoom(roomId, user.email, dropAction, `Confirmed User Drop (${reason})`);
-        }
-      }, 3000);
-      pendingRoomDrops.set(roomId, timer);
-    }
+    // Determine if this was an app background/kill ('background') vs network loss ('disconnected')
+    const dropAction =
+      reason.includes("Backgrounded") ||
+      reason.includes("Closed") ||
+      reason.includes("transport close") ||
+      reason.includes("client namespace disconnect")
+        ? 'background'
+        : 'disconnected';
+
+    // ⚡ 0ms IMMEDIATE NOTIFICATION & WIPE!
+    // Ensures that if a user kills the app, goes background, or loses connection during the 2-second hold,
+    // the partner is alerted on RandomConnectingScreen BEFORE the 2-second timer pushes them into InCall!
+    await notifyPartnerAndWipeRoom(
+      roomId,
+      user.email,
+      dropAction,
+      `Immediate User Drop (${reason})`,
+      user.partnerEmail
+    );
   } else {
     try { if (user.uid) await rtdb.ref(`users/${user.uid}`).update({ IsActive: false }); } catch (e) {}
   }
@@ -2046,8 +2082,7 @@ setInterval(async () => {
         // CASE 2: Document has a terminal status ('ended', 'next', 'background', 'disconnected')
         if (isTerminalRoomState(data)) {
           const action = data.status || 'ended';
-          io.to(roomId).emit('call_alert', getAlertPayload(action));
-          await forceWipeRoom(roomId, `${label} Lingering Status Sweeper`);
+          await notifyPartnerAndWipeRoom(roomId, data.endedBy || null, action, `${label} Lingering Status Sweeper`);
           continue;
         }
 
@@ -2066,8 +2101,7 @@ setInterval(async () => {
         const hasHandshake = (data.offer && data.answer) || (data.chatOffer && data.chatAnswer);
         if (roomAgeMs > 45000 && !hasHandshake) {
           console.log(`\n[👻 UNFINISHED HANDSHAKE] ${label} ${roomId} stuck without offer/answer for >45s.`);
-          io.to(roomId).emit('call_alert', getAlertPayload('disconnected'));
-          await forceWipeRoom(roomId, `${label} Unfinished Handshake Sweeper`);
+          await notifyPartnerAndWipeRoom(roomId, null, 'disconnected', `${label} Unfinished Handshake Sweeper`);
           continue;
         }
 
